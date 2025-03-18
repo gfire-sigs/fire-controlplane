@@ -29,15 +29,10 @@ type Update struct {
 	Data       []byte     // Data is the data of the update
 }
 
-type CurrentContext struct {
-	Now     int64    // Now is the current time in nanoseconds
-	Updates []Update // Updates is the list of updates that exist in the current context
-}
-
 // FSM represents the internal interface for finite state machine operations
 type FSM interface {
 	// Forward moves the FSM forward by one step
-	Forward(ctx context.Context, c *CurrentContext) error
+	Forward(ctx context.Context, updates []Update) error
 	// Updates returns the list of updates that the FSM has generated (updates are also included in the FSM's state)
 	Updates() []Update
 
