@@ -24,14 +24,14 @@ const (
 )
 
 type Update struct {
-	Registered int64 // Registered is the time when the update was registered in nanoseconds
-	Type       UpdateType
-	Data       []byte
+	Registered int64      // Registered is the time when the update was registered in nanoseconds
+	Type       UpdateType // Type is the type of the update
+	Data       []byte     // Data is the data of the update
 }
 
 type CurrentContext struct {
-	Now     int64 // Now is the current time in nanoseconds
-	Updates []Update
+	Now     int64    // Now is the current time in nanoseconds
+	Updates []Update // Updates is the list of updates that exist in the current context
 }
 
 // FSM represents the internal interface for finite state machine operations
