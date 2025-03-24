@@ -144,3 +144,33 @@ func TestAllocateMultipleFailures(t *testing.T) {
 		}
 	})
 }
+
+func TestArenaReset(t *testing.T) {
+	a := marena.NewArena(1024)
+	addr := a.Allocate(100)
+	if addr == marena.ARENA_INVALID_ADDRESS {
+		t.Fatal("Allocation failed before Reset")
+	}
+
+	a.Reset()
+
+	if a.Allocate(100) == marena.ARENA_INVALID_ADDRESS {
+		t.Error("Allocation failed after Reset")
+	}
+}
+
+func TestArenaRemaining(t *testing.T) {
+	a := marena.NewArena(marena.ARENA_PAGESIZE)
+	initialRemaining := a.Remaining()
+	if initialRemaining != marena.ARENA_PAGESIZE-marena.ARENA_MIN_ADDRESS {
+		t.Errorf("Expected initial remaining to be %d, got %d",
+			marena.ARENA_PAGESIZE-marena.ARENA_MIN_ADDRESS, initialRemaining)
+	}
+
+	a.Allocate(200)
+	newRemaining := a.Remaining()
+	expected := marena.ARENA_PAGESIZE - marena.ARENA_MIN_ADDRESS - int64((200+7)>>3<<3)
+	if newRemaining != expected {
+		t.Errorf("Expected new remaining = %d, got %d", expected, newRemaining)
+	}
+}

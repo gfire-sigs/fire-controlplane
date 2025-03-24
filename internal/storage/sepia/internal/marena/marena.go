@@ -114,6 +114,17 @@ func (g *Arena) View(address uint64) []byte {
 	return g.buffer[offset : offset+size]
 }
 
+// Reset resets the Arena cursor to the minimal valid address.
+func (g *Arena) Reset() {
+	atomic.StoreInt64(&g.cursor, ARENA_MIN_ADDRESS)
+}
+
+// Remaining returns the number of bytes remaining in the Arena.
+func (g *Arena) Remaining() int64 {
+	// We load the cursor atomically for thread safety
+	return g.size - atomic.LoadInt64(&g.cursor)
+}
+
 // Size extracts the size portion from a 64-bit address.
 func Size(address uint64) int {
 	return int(address & (1<<32 - 1))
