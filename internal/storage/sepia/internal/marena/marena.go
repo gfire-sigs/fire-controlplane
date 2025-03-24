@@ -1,6 +1,13 @@
 package marena
 
-import "sync/atomic"
+import (
+	"errors"
+	"sync/atomic"
+)
+
+var (
+	ErrAllocationFailed = errors.New("marena: allocation failed")
+)
 
 const (
 	// ARENA_MAX_ALLOC_SIZE defines the maximum allocatable size.
@@ -114,9 +121,19 @@ func (g *Arena) View(address uint64) []byte {
 	return g.buffer[offset : offset+size]
 }
 
+// Index returns a pointer to the byte at the given offset in the arena.
+func (g *Arena) Index(offset uint32) *byte {
+	return &g.buffer[offset]
+}
+
 // Reset resets the Arena cursor to the minimal valid address.
 func (g *Arena) Reset() {
 	atomic.StoreInt64(&g.cursor, ARENA_MIN_ADDRESS)
+
+	// memset(g.buffer, 0, g.size)
+	for i := range g.buffer {
+		g.buffer[i] = 0
+	}
 }
 
 // Remaining returns the number of bytes remaining in the Arena.
@@ -126,11 +143,11 @@ func (g *Arena) Remaining() int64 {
 }
 
 // Size extracts the size portion from a 64-bit address.
-func Size(address uint64) int {
-	return int(address & (1<<32 - 1))
+func Size(address uint64) uint32 {
+	return uint32(address & (1<<32 - 1))
 }
 
 // Offset extracts the offset portion from a 64-bit address.
-func Offset(address uint64) int {
-	return int(address >> 32)
+func Offset(address uint64) uint32 {
+	return uint32(address >> 32)
 }

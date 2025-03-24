@@ -27,7 +27,7 @@ func TestAllocate(t *testing.T) {
 		t.Fatal("Allocation returned invalid address")
 	}
 	gotSize := marena.Size(addr)
-	wantSize := 100
+	wantSize := uint32(100)
 	if gotSize != wantSize {
 		t.Errorf("Size(addr) = %d, want %d", gotSize, wantSize)
 	}
