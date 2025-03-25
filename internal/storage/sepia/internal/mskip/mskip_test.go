@@ -87,6 +87,24 @@ func TestSkipListInsert(t *testing.T) {
 	if newnode == 0 {
 		t.Fatalf("insertNext failed")
 	}
+
+	// Test 5: Value overwrite for existing key
+	value1_updated := []byte("value1_updated")
+	before = skl.seeklt(key1, &log)
+	newnode = skl.insertNext(&log, key1, value1_updated)
+	if newnode == 0 {
+		t.Fatalf("value overwrite failed")
+	}
+
+	// Verify the value was updated
+	if string(skl.arena.View(skl.getNode(newnode).valuePtr)) != "value1_updated" {
+		t.Fatalf("expected value1_updated, got %s", string(skl.arena.View(skl.getNode(newnode).valuePtr)))
+	}
+
+	// Verify the key remains unchanged
+	if string(skl.arena.View(skl.getNode(newnode).keyPtr)) != "key1" {
+		t.Fatalf("expected key1, got %s", string(skl.arena.View(skl.getNode(newnode).keyPtr)))
+	}
 }
 
 // TestSkipListIterator verifies the iterator operations of the skiplist:
