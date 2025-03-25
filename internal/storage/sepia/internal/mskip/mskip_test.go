@@ -90,8 +90,8 @@ func TestSkipListInsert(t *testing.T) {
 
 // BenchmarkSkipList measures the performance of skiplist operations.
 // The benchmark:
-// 1. Creates a skiplist with 64MB arena capacity
-// 2. Inserts 10,000 sorted key-value pairs
+// 1. Creates a skiplist with 100MB arena capacity
+// 2. Inserts 1,000,000 sorted key-value pairs
 // 3. Performs random lookups on the inserted keys
 //
 // This helps evaluate:
@@ -99,8 +99,8 @@ func TestSkipListInsert(t *testing.T) {
 // - Search performance with random access patterns
 // - Skiplist level distribution effects
 func BenchmarkSkipList(b *testing.B) {
-	// Initialize arena with 64MB capacity
-	arena := marena.NewArena(64 << 20)
+	// Initialize arena with 100MB capacity
+	arena := marena.NewArena(100 << 20)
 
 	// Create skiplist with deterministic seed for reproducible results
 	skl, err := NewSkipList(arena, bytes.Compare, 42)
@@ -108,9 +108,9 @@ func BenchmarkSkipList(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	// Generate 10000 sorted keys for consistent test data
+	// Generate 1,000,000 sorted keys for consistent test data
 	var keys [][]byte
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < 1_000_000; i++ {
 		key := []byte(fmt.Sprintf("key%08d", i))
 		keys = append(keys, key)
 	}
@@ -125,11 +125,12 @@ func BenchmarkSkipList(b *testing.B) {
 		}
 	}
 
+	// Create RNG with fixed seed for reproducible random key selection
+	rng := rand.New(rand.NewPCG(42, 24))
+
 	// Reset timer before starting the actual benchmark
 	b.ResetTimer()
 
-	// Create RNG with fixed seed for reproducible random key selection
-	rng := rand.New(rand.NewPCG(42, 24))
 	for i := 0; i < b.N; i++ {
 		// Pick a random key from our list to simulate random access pattern
 		idx := rng.Int() % len(keys)
