@@ -3,6 +3,8 @@
 package mskip
 
 import (
+	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/marena"
@@ -71,6 +73,26 @@ type SkipList struct {
 	//
 	//	0 if key1 == key2
 	//	1 if key1 > key2
+
+	refCount int64 // Number of active references to this skiplist
+}
+
+// IncRef increments the reference count of the skiplist atomically.
+// Returns the new reference count after incrementing.
+func (g *SkipList) IncRef() int64 {
+	return atomic.AddInt64(&g.refCount, 1)
+}
+
+// DecRef decrements the reference count of the skiplist atomically.
+// Returns the new reference count after decrementing.
+func (g *SkipList) DecRef() int64 {
+	return atomic.AddInt64(&g.refCount, -1)
+}
+
+// RefCount returns the current reference count of the skiplist.
+// This is an atomic operation that returns the current value without modifying it.
+func (g *SkipList) RefCount() int64 {
+	return atomic.LoadInt64(&g.refCount)
 }
 
 // NewSkipList creates a new skiplist with the given arena allocator and comparison function.
@@ -78,10 +100,11 @@ type SkipList struct {
 // Returns an error if the initial head node allocation fails.
 func NewSkipList(arena *marena.Arena, compare func(key1, key2 []byte) int, seed uint64) (*SkipList, error) {
 	g := &SkipList{
-		arena:   arena,
-		seed:    seed,
-		head:    0,
-		compare: compare,
+		arena:    arena,
+		seed:     seed,
+		head:     0,
+		compare:  compare,
+		refCount: 1,
 	}
 
 	// Create head node with maximum level
@@ -208,4 +231,139 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 	}
 
 	return marena.Offset(newNode)
+}
+
+// Insert adds a new key-value pair to the skiplist or updates an existing one.
+// Returns true if the operation was successful, false if memory allocation failed.
+// The key and value are stored as byte slices in the arena allocator.
+func (g *SkipList) Insert(key []byte, value []byte) bool {
+	var log [MSKIP_MAX_LEVEL]uint32
+	g.seeklt(key, &log)
+	return g.insertNext(&log, key, value) != marena.ARENA_INVALID_ADDRESS
+}
+
+var iteratorPool sync.Pool = sync.Pool{
+	New: func() interface{} {
+		return &SkipListIterator{}
+	},
+}
+
+// SkipListIterator provides bidirectional iteration over skiplist entries.
+// It maintains its position in the skiplist and supports forward/backward traversal
+// as well as seeking to specific positions.
+type SkipListIterator struct {
+	skl     *SkipList
+	current uint32
+}
+
+// Iterator creates and returns a new iterator for traversing the skiplist.
+// The iterator is initialized in an invalid state and must be positioned using
+// First(), SeekLT(), or SeekLE() before use. The returned iterator must be
+// closed when no longer needed.
+func (g *SkipList) Iterator() *SkipListIterator {
+	g.IncRef()
+	iter := iteratorPool.Get().(*SkipListIterator)
+	iter.skl = g
+	iter.current = marena.ARENA_INVALID_ADDRESS
+	return iter
+}
+
+// First positions the iterator at the first key in the skiplist.
+// After this call, the iterator is positioned at the smallest key
+// if the skiplist is not empty.
+func (g *SkipListIterator) First() {
+	g.current = g.skl.head
+	g.Next()
+}
+
+// SeekLT (Seek Less Than) positions the iterator at the largest key strictly less than
+// the provided key. If no such key exists, the iterator becomes invalid.
+func (g *SkipListIterator) SeekLT(key []byte) {
+	var log [MSKIP_MAX_LEVEL]uint32
+	g.current = g.skl.seeklt(key, &log)
+}
+
+// SeekLE (Seek Less than or Equal) positions the iterator at the largest key
+// less than or equal to the provided key. If the key exists, the iterator
+// will be positioned at that exact key. If no such key exists, the iterator
+// becomes invalid.
+func (g *SkipListIterator) SeekLE(key []byte) {
+	var log [MSKIP_MAX_LEVEL]uint32
+	g.current = g.skl.seeklt(key, &log)
+	if !g.Valid() {
+		return
+	}
+
+	next := g.skl.getNode(g.current).nexts[0]
+	if next != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(next).keyPtr)) == 0 {
+		g.current = next
+	}
+}
+
+// Valid returns true if the iterator is positioned at a valid node in the skiplist.
+// Returns false if the iterator has moved past the end or is not initialized.
+func (g *SkipListIterator) Valid() bool {
+	return g.current != marena.ARENA_INVALID_ADDRESS
+}
+
+// Next advances the iterator to the next key in the skiplist.
+// If the iterator is invalid or at the last key, it remains invalid.
+func (g *SkipListIterator) Next() {
+	if !g.Valid() {
+		return
+	}
+
+	node := g.skl.getNode(g.current)
+	g.current = node.nexts[0]
+}
+
+// Prev moves the iterator to the previous key in the skiplist.
+// If the iterator is invalid or at the first key, it becomes invalid.
+func (g *SkipListIterator) Prev() {
+	if !g.Valid() {
+		return
+	}
+
+	current := g.current
+	last := g.skl.seeklt(g.skl.arena.View(g.skl.getNode(current).keyPtr), nil)
+	if last == g.skl.head {
+		g.current = marena.ARENA_INVALID_ADDRESS
+		return
+	}
+	g.current = last
+}
+
+// Key returns the key at the current iterator position.
+// Returns nil if the iterator is not valid.
+func (g *SkipListIterator) Key() []byte {
+	if !g.Valid() {
+		return nil
+	}
+
+	node := g.skl.getNode(g.current)
+	return g.skl.arena.View(node.keyPtr)
+}
+
+// Value returns the value associated with the key at the current iterator position.
+// Returns nil if the iterator is not valid.
+func (g *SkipListIterator) Value() []byte {
+	if !g.Valid() {
+		return nil
+	}
+
+	node := g.skl.getNode(g.current)
+	return g.skl.arena.View(node.valuePtr)
+}
+
+// Close releases the iterator's resources and returns it to the pool.
+// The iterator becomes invalid after this call and must not be used.
+// This method decrements the reference count of the associated skiplist.
+func (g *SkipListIterator) Close() {
+	if g == nil {
+		return
+	}
+	g.skl.DecRef()
+	g.skl = nil
+	g.current = marena.ARENA_INVALID_ADDRESS
+	iteratorPool.Put(g)
 }
