@@ -7,35 +7,42 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 
 // Reader allows searching for keys within an SST file.
 type Reader struct {
-	r      io.ReaderAt
-	footer SSTFooter
-	index  []indexEntry
-	seed   uint64
+	r       io.ReaderAt
+	footer  SSTFooter
+	index   []indexEntry
+	configs SSTableConfigs
 }
 
 // NewReader initializes a new SST reader.
-func NewReader(r io.ReaderAt, size int64) (*Reader, error) {
+func NewReader(r io.ReaderAt, size int64) (*Reader, SSTableConfigs, error) {
 	footer, err := readFooter(r, size)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read footer: %w", err)
+		return nil, SSTableConfigs{}, fmt.Errorf("failed to read footer: %w", err)
 	}
 
-	index, err := readIndexBlock(r, footer.IndexHandle, footer.WyhashSeed)
+	configs, err := readMetaindexBlock(r, footer.MetaindexHandle)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read index block: %w", err)
+		return nil, SSTableConfigs{}, fmt.Errorf("failed to read metaindex block: %w", err)
+	}
+
+	index, err := readIndexBlock(r, footer.IndexHandle, configs.WyhashSeed)
+	if err != nil {
+		return nil, SSTableConfigs{}, fmt.Errorf("failed to read index block: %w", err)
 	}
 
 	return &Reader{
-		r:      r,
-		footer: footer,
-		index:  index,
-		seed:   footer.WyhashSeed,
-	}, nil
+		r:       r,
+		footer:  footer,
+		index:   index,
+		configs: configs,
+	}, configs, nil
 }
 
 // Get searches for a key and returns its corresponding value.
@@ -73,14 +80,45 @@ func readFooter(r io.ReaderAt, size int64) (SSTFooter, error) {
 	return footer, nil
 }
 
-func readIndexBlock(r io.ReaderAt, handle blockHandle, seed uint64) ([]indexEntry, error) {
+func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, error) {
+	buf := make([]byte, handle.size)
+	_, err := r.ReadAt(buf, int64(handle.offset))
+	if err != nil {
+		return SSTableConfigs{}, err
+	}
+
+	// For now, metaindex block only contains SSTableConfigs
+	// Read SSTableConfigs from the buffer
+	reader := bytes.NewReader(buf)
+
+	var configs SSTableConfigs
+	compressionTypeByte, err := reader.ReadByte()
+	if err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read compression type: %w", err)
+	}
+	configs.CompressionType = CompressionType(compressionTypeByte)
+
+	if err := binary.Read(reader, binary.LittleEndian, &configs.BlockSize); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read block size: %w", err)
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &configs.RestartInterval); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read restart interval: %w", err)
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &configs.WyhashSeed); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read wyhash seed: %w", err)
+	}
+
+	return configs, nil
+}
+
+func readIndexBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) ([]indexEntry, error) {
 	buf := make([]byte, handle.size)
 	_, err := r.ReadAt(buf, int64(handle.offset))
 	if err != nil {
 		return nil, err
 	}
 
-	checksum := wyhash.Hash(buf[:len(buf)-8], seed)
+	checksum := wyhash.Hash(buf[:len(buf)-8], wyhashSeed)
 	expectedChecksum := binary.LittleEndian.Uint64(buf[len(buf)-8:])
 	if checksum != expectedChecksum {
 		return nil, fmt.Errorf("index block checksum mismatch")
@@ -119,28 +157,61 @@ func (rd *Reader) findDataBlock(key []byte) (blockHandle, bool) {
 }
 
 func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, error) {
-	buf := make([]byte, handle.size)
-	_, err := rd.r.ReadAt(buf, int64(handle.offset))
+	rawBlock := make([]byte, handle.size)
+	_, err := rd.r.ReadAt(rawBlock, int64(handle.offset))
 	if err != nil {
 		return nil, false, err
 	}
 
-	checksum := wyhash.Hash(buf[:len(buf)-8], rd.seed)
-	expectedChecksum := binary.LittleEndian.Uint64(buf[len(buf)-8:])
+	// Read block header
+	blockHeader := BlockHeader{
+		CompressionType: CompressionType(rawBlock[0]),
+	}
+
+	// Calculate checksum on the block data (excluding header and checksum itself).
+	// The checksum is on the *compressed* data + header.
+	checksum := wyhash.Hash(rawBlock[:len(rawBlock)-8], rd.configs.WyhashSeed)
+	expectedChecksum := binary.LittleEndian.Uint64(rawBlock[len(rawBlock)-8:])
 	if checksum != expectedChecksum {
 		return nil, false, fmt.Errorf("data block checksum mismatch")
 	}
 
-	// Decode the block and search for the key
-	reader := bytes.NewReader(buf[:len(buf)-8])
-	var prevKey []byte
-	for reader.Len() > 0 {
-		// Stop before reading restart points
-		if reader.Len() <= 4+4*int(binary.LittleEndian.Uint32(buf[len(buf)-12:len(buf)-8])) {
-			break
-		}
+	// blockData starts after the header and ends before the checksum.
+	blockData := rawBlock[1 : len(rawBlock)-8] // 1 byte for CompressionType
 
-		kv, err := decodeEntry(reader, prevKey)
+	var decodedBlock []byte
+	switch blockHeader.CompressionType {
+	case CompressionTypeSnappy:
+		decodedBlock, err = snappy.Decode(nil, blockData)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to decompress snappy block: %w", err)
+		}
+	case CompressionTypeZstd:
+		reader := bytes.NewReader(blockData)
+		zstdReader, err := zstd.NewReader(reader)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
+		}
+		defer zstdReader.Close()
+		decodedBlock, err = io.ReadAll(zstdReader)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to decompress zstd block: %w", err)
+		}
+	default:
+		decodedBlock = blockData
+	}
+
+	// Extract restart points and their count from the end of the decoded block
+	numRestartPoints := binary.LittleEndian.Uint32(decodedBlock[len(decodedBlock)-4:])
+	restartPointsStart := len(decodedBlock) - 4 - int(numRestartPoints)*4
+
+	// Create a reader for the actual key-value data, excluding restart points and their count
+	dataReader := bytes.NewReader(decodedBlock[:restartPointsStart])
+
+	// Decode the block and search for the key
+	var prevKey []byte
+	for dataReader.Len() > 0 {
+		kv, err := decodeEntry(dataReader, prevKey)
 		if err != nil {
 			return nil, false, err
 		}

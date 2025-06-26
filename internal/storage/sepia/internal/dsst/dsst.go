@@ -6,21 +6,37 @@ import (
 	"io"
 )
 
+//go:generate stringer -type=CompressionType
+type CompressionType byte
+
+const (
+	CompressionTypeNone CompressionType = iota
+	CompressionTypeSnappy
+	CompressionTypeZstd
+)
+
 // Constants defining the SST file format structure and flags based on the RFC.
 const (
 	// SST_V1_MAGIC is used in the file footer to identify the file format and version.
 	SST_V1_MAGIC = "SEPIASSTMAGICV01"
 
-	// SST_MAX_BLOCK_SIZE defines the target size for data blocks, as recommended by the RFC.
-	SST_MAX_BLOCK_SIZE = 8 << 10 // 8KB
-
-	// SST_RESTART_POINT_INTERVAL is the number of keys between restart points within a data block.
-	SST_RESTART_POINT_INTERVAL = 16
-
 	// SST_FOOTER_SIZE is the fixed size of the file footer.
 	// 2*blockHandle(16) + 8-byte wyhash_seed + 16-byte magic + 8-byte version
 	SST_FOOTER_SIZE = 64
 )
+
+// SSTableConfigs holds the configuration parameters for an SSTable.
+type SSTableConfigs struct {
+	CompressionType CompressionType
+	BlockSize       uint32 // Target size for data blocks, e.g., 64KB
+	RestartInterval uint32 // Number of keys between restart points within a data block
+	WyhashSeed      uint64 // Seed for wyhash checksums
+}
+
+// BlockHeader contains metadata for each data block.
+type BlockHeader struct {
+	CompressionType CompressionType
+}
 
 // KVEntry represents a single key-value pair.
 type KVEntry struct {

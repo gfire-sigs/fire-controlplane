@@ -77,7 +77,15 @@ An SST file consists of a sequence of data blocks, followed by an index block, a
 
 Data blocks store sorted key-value entries with prefix compression.
 
-### 5.1 Entry Encoding
+### 5.1 Block Header
+
+Each data block is prefixed with a fixed-size header containing metadata about the block. This header is included in the checksum calculation.
+
+| Field           | Description                                         |
+|-----------------|-----------------------------------------------------|
+| compression_type| 1-byte enum indicating the compression algorithm used for the block (e.g., None, Snappy, Zstd). |
+
+### 5.2 Entry Encoding
 
 Each entry encodes:
 
@@ -91,13 +99,13 @@ Each entry encodes:
 
 - The first entry in a block has `shared_prefix_len = 0`.
 
-### 5.2 Restart Points
+### 5.3 Restart Points
 
 - Full keys are stored at regular intervals (e.g., every 16 entries).
 - Restart points enable fast seeking within a block.
 - A list of restart offsets is stored at the end of each block.
 
-### 5.3 Block Trailer
+### 5.4 Block Trailer
 
 The trailer contains:
 
@@ -107,7 +115,7 @@ The trailer contains:
 | restart_point_offsets[]   | List of restart offsets         |
 | initialization_vector     | 12-byte unique IV (if encrypted)|
 | authentication_tag        | 16-byte GCM tag (if encrypted)  |
-| block_checksum (optional) | 8-byte wyhash checksum          |
+| block_checksum (optional) | 8-byte wyhash checksum (covers block header + compressed data + restart points + restart point count) |
 
 ---
 
@@ -119,11 +127,14 @@ The index block contains entries mapping key ranges to data block offsets. Typic
 
 ## 7. Metaindex Block
 
-The metaindex block contains pointers to auxiliary metadata, including:
+The metaindex block currently stores the `SSTableConfigs` structure, which defines the global configuration parameters for the SST file. In future versions, it may be extended to include pointers to other auxiliary metadata, such as filter blocks or properties.
 
-- Filter blocks (e.g., Bloom filters)
-- Properties
-- Other metadata
+| Field             | Description                                         |
+|-------------------|-----------------------------------------------------|
+| CompressionType   | 1-byte enum indicating the compression algorithm used for data blocks. |
+| BlockSize         | 4-byte unsigned integer representing the target size for data blocks in bytes (e.g., 64KB). |
+| RestartInterval   | 4-byte unsigned integer representing the number of keys between restart points within a data block. |
+| WyhashSeed        | 8-byte unsigned integer used as the seed for wyhash checksums throughout the file. |
 
 ---
 
@@ -168,11 +179,12 @@ Data blocks may be encrypted using AES-GCM-256 with the following parameters:
 
 ## 10. Tuning Parameters
 
+These parameters are now part of the `SSTableConfigs` structure stored in the Metaindex Block, allowing for file-specific configuration.
+
 | Parameter            | Description                                    | Typical Value |
 |----------------------|------------------------------------------------|---------------|
-| Block size           | Size of each data block                       | 4KB - 8KB     |
+| Block size           | Size of each data block                       | 64KB          |
 | Restart interval     | Entries between restart points                | 16            |
-| Compression algorithm| Block-level compression method                | Snappy/zstd   |
 
 ---
 

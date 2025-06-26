@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 
@@ -20,19 +22,16 @@ type Writer struct {
 	restartPoints   []uint32
 	prevKey         []byte
 	entryCounter    int
-	wyhashSeed      uint64
+	configs         SSTableConfigs
 	firstKeyInBlock []byte
 }
 
 // NewWriter creates a new SST writer.
-func NewWriter(w io.Writer) *Writer {
-	// For tests, we might want a fixed seed. For production, a random seed is better.
-	// We will use a fixed seed for now to make tests deterministic.
-	seed := uint64(0)
+func NewWriter(w io.Writer, configs SSTableConfigs) *Writer {
 	return &Writer{
 		w:            bufio.NewWriter(w),
 		dataBlockBuf: new(bytes.Buffer),
-		wyhashSeed:   seed,
+		configs:      configs,
 	}
 }
 
@@ -46,7 +45,7 @@ func (wr *Writer) Add(key, value []byte) error {
 		wr.firstKeyInBlock = key
 	}
 
-	if wr.entryCounter%SST_RESTART_POINT_INTERVAL == 0 {
+	if wr.entryCounter%int(wr.configs.RestartInterval) == 0 {
 		wr.restartPoints = append(wr.restartPoints, uint32(wr.dataBlockBuf.Len()))
 	}
 
@@ -54,7 +53,7 @@ func (wr *Writer) Add(key, value []byte) error {
 	wr.prevKey = append(wr.prevKey[:0], key...)
 	wr.entryCounter++
 
-	if wr.dataBlockBuf.Len() >= SST_MAX_BLOCK_SIZE {
+	if wr.dataBlockBuf.Len() >= int(wr.configs.BlockSize) {
 		return wr.finishDataBlock()
 	}
 
@@ -110,15 +109,47 @@ func (wr *Writer) finishDataBlock() error {
 }
 
 func (wr *Writer) writeDataBlock(blockBuf *bytes.Buffer, restartPoints []uint32) (blockHandle, error) {
+	// Append restart points and their count to the end of the block.
+	// The restart points are offsets within the uncompressed data.
+	// The last 4 bytes of the uncompressed data will be the count of restart points.
+	// The 4*count bytes before that will be the restart point offsets.
 	for _, rpOffset := range restartPoints {
 		binary.Write(blockBuf, binary.LittleEndian, rpOffset)
 	}
 	binary.Write(blockBuf, binary.LittleEndian, uint32(len(restartPoints)))
 
-	checksum := wyhash.Hash(blockBuf.Bytes(), wr.wyhashSeed)
-	binary.Write(blockBuf, binary.LittleEndian, checksum)
+	// Create block header
+	blockHeader := BlockHeader{
+		CompressionType: wr.configs.CompressionType,
+	}
 
-	written, err := wr.w.Write(blockBuf.Bytes())
+	// Serialize block header
+	headerBuf := new(bytes.Buffer)
+	binary.Write(headerBuf, binary.LittleEndian, byte(blockHeader.CompressionType))
+
+	// Compress the block if requested.
+	var compressedData []byte
+	switch wr.configs.CompressionType {
+	case CompressionTypeSnappy:
+		compressedData = snappy.Encode(nil, blockBuf.Bytes())
+	case CompressionTypeZstd:
+		encoder, _ := zstd.NewWriter(nil)
+		compressedData = encoder.EncodeAll(blockBuf.Bytes(), nil)
+		encoder.Close()
+	default:
+		compressedData = blockBuf.Bytes()
+	}
+
+	// Prepend the serialized block header to the compressed data.
+	finalBlock := new(bytes.Buffer)
+	finalBlock.Write(headerBuf.Bytes())
+	finalBlock.Write(compressedData)
+
+	// Calculate checksum on the final block (including header and compressed data).
+	checksum := wyhash.Hash(finalBlock.Bytes(), wr.configs.WyhashSeed)
+	binary.Write(finalBlock, binary.LittleEndian, checksum)
+
+	written, err := wr.w.Write(finalBlock.Bytes())
 	if err != nil {
 		return blockHandle{}, err
 	}
@@ -132,7 +163,7 @@ func (wr *Writer) writeIndexBlock() (blockHandle, error) {
 		encodeIndexEntry(buf, entry)
 	}
 
-	checksum := wyhash.Hash(buf.Bytes(), wr.wyhashSeed)
+	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(buf, binary.LittleEndian, checksum)
 
 	written, err := wr.w.Write(buf.Bytes())
@@ -146,9 +177,15 @@ func (wr *Writer) writeIndexBlock() (blockHandle, error) {
 }
 
 func (wr *Writer) writeMetaindexBlock() (blockHandle, error) {
-	buf := new(bytes.Buffer) // Empty metaindex block
+	buf := new(bytes.Buffer)
 
-	checksum := wyhash.Hash(buf.Bytes(), wr.wyhashSeed)
+	// Serialize SSTableConfigs into the metaindex block
+	binary.Write(buf, binary.LittleEndian, byte(wr.configs.CompressionType))
+	binary.Write(buf, binary.LittleEndian, wr.configs.BlockSize)
+	binary.Write(buf, binary.LittleEndian, wr.configs.RestartInterval)
+	binary.Write(buf, binary.LittleEndian, wr.configs.WyhashSeed)
+
+	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(buf, binary.LittleEndian, checksum)
 
 	written, err := wr.w.Write(buf.Bytes())
@@ -165,7 +202,7 @@ func (wr *Writer) writeFooter(indexHandle, metaindexHandle blockHandle) error {
 	footer := SSTFooter{
 		MetaindexHandle: metaindexHandle,
 		IndexHandle:     indexHandle,
-		WyhashSeed:      wr.wyhashSeed,
+		WyhashSeed:      wr.configs.WyhashSeed,
 		Version:         1,
 	}
 	copy(footer.Magic[:], SST_V1_MAGIC)
