@@ -4,6 +4,9 @@ package dsst
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -118,15 +121,6 @@ func (wr *Writer) writeDataBlock(blockBuf *bytes.Buffer, restartPoints []uint32)
 	}
 	binary.Write(blockBuf, binary.LittleEndian, uint32(len(restartPoints)))
 
-	// Create block header
-	blockHeader := BlockHeader{
-		CompressionType: wr.configs.CompressionType,
-	}
-
-	// Serialize block header
-	headerBuf := new(bytes.Buffer)
-	binary.Write(headerBuf, binary.LittleEndian, byte(blockHeader.CompressionType))
-
 	// Compress the block if requested.
 	var compressedData []byte
 	switch wr.configs.CompressionType {
@@ -140,12 +134,43 @@ func (wr *Writer) writeDataBlock(blockBuf *bytes.Buffer, restartPoints []uint32)
 		compressedData = blockBuf.Bytes()
 	}
 
-	// Prepend the serialized block header to the compressed data.
+	// Encrypt the compressed data
+	blockCipher, err := aes.NewCipher(wr.configs.EncryptionKey)
+	if err != nil {
+		return blockHandle{}, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(blockCipher)
+	if err != nil {
+		return blockHandle{}, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return blockHandle{}, fmt.Errorf("failed to generate nonce: %w", err)
+	}
+
+	encryptedData := gcm.Seal(nil, nonce, compressedData, nil)
+
+	// Create block header
+	blockHeader := BlockHeader{
+		CompressionType: wr.configs.CompressionType,
+	}
+	copy(blockHeader.InitializationVector[:], nonce)
+	copy(blockHeader.AuthenticationTag[:], encryptedData[len(encryptedData)-aes.BlockSize:])
+	encryptedData = encryptedData[:len(encryptedData)-aes.BlockSize]
+
+	// Serialize block header
+	headerBuf := new(bytes.Buffer)
+	binary.Write(headerBuf, binary.LittleEndian, byte(blockHeader.CompressionType))
+	headerBuf.Write(blockHeader.InitializationVector[:])
+	headerBuf.Write(blockHeader.AuthenticationTag[:])
+
+	// Prepend the serialized block header to the encrypted data.
 	finalBlock := new(bytes.Buffer)
 	finalBlock.Write(headerBuf.Bytes())
-	finalBlock.Write(compressedData)
+	finalBlock.Write(encryptedData)
 
-	// Calculate checksum on the final block (including header and compressed data).
+	// Calculate checksum on the final block (including header and encrypted data).
 	checksum := wyhash.Hash(finalBlock.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(finalBlock, binary.LittleEndian, checksum)
 
@@ -184,6 +209,7 @@ func (wr *Writer) writeMetaindexBlock() (blockHandle, error) {
 	binary.Write(buf, binary.LittleEndian, wr.configs.BlockSize)
 	binary.Write(buf, binary.LittleEndian, wr.configs.RestartInterval)
 	binary.Write(buf, binary.LittleEndian, wr.configs.WyhashSeed)
+	buf.Write(wr.configs.EncryptionKey)
 
 	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(buf, binary.LittleEndian, checksum)

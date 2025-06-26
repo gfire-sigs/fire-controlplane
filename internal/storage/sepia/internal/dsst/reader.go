@@ -3,6 +3,8 @@ package dsst
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -87,8 +89,6 @@ func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, erro
 		return SSTableConfigs{}, err
 	}
 
-	// For now, metaindex block only contains SSTableConfigs
-	// Read SSTableConfigs from the buffer
 	reader := bytes.NewReader(buf)
 
 	var configs SSTableConfigs
@@ -106,6 +106,11 @@ func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, erro
 	}
 	if err := binary.Read(reader, binary.LittleEndian, &configs.WyhashSeed); err != nil {
 		return SSTableConfigs{}, fmt.Errorf("failed to read wyhash seed: %w", err)
+	}
+
+	configs.EncryptionKey = make([]byte, 32) // AES-256 key is 32 bytes
+	if _, err := io.ReadFull(reader, configs.EncryptionKey); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read encryption key: %w", err)
 	}
 
 	return configs, nil
@@ -167,27 +172,46 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	blockHeader := BlockHeader{
 		CompressionType: CompressionType(rawBlock[0]),
 	}
+	copy(blockHeader.InitializationVector[:], rawBlock[1:13])
+	copy(blockHeader.AuthenticationTag[:], rawBlock[13:13+aes.BlockSize])
 
 	// Calculate checksum on the block data (excluding header and checksum itself).
-	// The checksum is on the *compressed* data + header.
+	// The checksum is on the *encrypted* data + header.
 	checksum := wyhash.Hash(rawBlock[:len(rawBlock)-8], rd.configs.WyhashSeed)
 	expectedChecksum := binary.LittleEndian.Uint64(rawBlock[len(rawBlock)-8:])
 	if checksum != expectedChecksum {
 		return nil, false, fmt.Errorf("data block checksum mismatch")
 	}
 
-	// blockData starts after the header and ends before the checksum.
-	blockData := rawBlock[1 : len(rawBlock)-8] // 1 byte for CompressionType
+	// encryptedData starts after the header and ends before the checksum.
+	encryptedData := rawBlock[29 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV + 16 bytes for AuthTag
+
+	// Decrypt the data
+	blockCipher, err := aes.NewCipher(rd.configs.EncryptionKey)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(blockCipher)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to create GCM: %w", err)
+	}
+
+	// The encryptedData does not contain the tag, it's separate in the header.
+	// We need to append the tag to the encryptedData before opening.
+	decryptedData, err := gcm.Open(nil, blockHeader.InitializationVector[:], append(encryptedData, blockHeader.AuthenticationTag[:]...), nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to decrypt block: %w", err)
+	}
 
 	var decodedBlock []byte
 	switch blockHeader.CompressionType {
 	case CompressionTypeSnappy:
-		decodedBlock, err = snappy.Decode(nil, blockData)
+		decodedBlock, err = snappy.Decode(nil, decryptedData)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to decompress snappy block: %w", err)
 		}
 	case CompressionTypeZstd:
-		reader := bytes.NewReader(blockData)
+		reader := bytes.NewReader(decryptedData)
 		zstdReader, err := zstd.NewReader(reader)
 		if err != nil {
 			return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
@@ -198,7 +222,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 			return nil, false, fmt.Errorf("failed to decompress zstd block: %w", err)
 		}
 	default:
-		decodedBlock = blockData
+		decodedBlock = decryptedData
 	}
 
 	// Extract restart points and their count from the end of the decoded block

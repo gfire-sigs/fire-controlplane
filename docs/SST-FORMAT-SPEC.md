@@ -81,9 +81,11 @@ Data blocks store sorted key-value entries with prefix compression.
 
 Each data block is prefixed with a fixed-size header containing metadata about the block. This header is included in the checksum calculation.
 
-| Field           | Description                                         |
-|-----------------|-----------------------------------------------------|
-| compression_type| 1-byte enum indicating the compression algorithm used for the block (e.g., None, Snappy, Zstd). |
+| Field                     | Description                                         |
+|---------------------------|-----------------------------------------------------|
+| compression_type          | 1-byte enum indicating the compression algorithm used for the block (e.g., None, Snappy, Zstd). |
+| initialization_vector     | 12-byte unique IV for AES-GCM encryption.           |
+| authentication_tag        | 16-byte GCM tag for authenticated encryption.       |
 
 ### 5.2 Entry Encoding
 
@@ -135,6 +137,7 @@ The metaindex block currently stores the `SSTableConfigs` structure, which defin
 | BlockSize         | 4-byte unsigned integer representing the target size for data blocks in bytes (e.g., 64KB). |
 | RestartInterval   | 4-byte unsigned integer representing the number of keys between restart points within a data block. |
 | WyhashSeed        | 8-byte unsigned integer used as the seed for wyhash checksums throughout the file. |
+| EncryptionKey     | 32-byte AES-256 key used for block encryption. If unencrypted, a dummy key (e.g., all zeros) is used. |
 
 ---
 
@@ -162,7 +165,7 @@ Filter blocks, such as Bloom filters, may be included to quickly rule out non-ex
 
 ### 9.3 Encryption
 
-Data blocks may be encrypted using AES-GCM-256 with the following parameters:
+Data blocks are always encrypted using AES-GCM-256. If unencrypted storage is desired, a dummy key (e.g., a 32-byte zero key) is used for encryption. The encryption parameters are as follows:
 
 - **Key Derivation**: HKDF-SHA256 with:
   - Master key (32 bytes)

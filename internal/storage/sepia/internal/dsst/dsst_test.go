@@ -24,6 +24,7 @@ func TestWriterAndReader(t *testing.T) {
 				BlockSize:       64 << 10, // 64KB
 				RestartInterval: 16,
 				WyhashSeed:      0, // Fixed seed for deterministic tests
+				EncryptionKey:   make([]byte, 32), // Dummy 32-byte key for testing
 			}
 
 			// Test Writer
