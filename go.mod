@@ -1,3 +1,3 @@
 module pkg.gfire.dev/controlplane
 
-go 1.24.1
+go 1.25rc1
