@@ -31,12 +31,11 @@ type SSTableConfigs struct {
 	BlockSize       uint32 // Target size for data blocks, e.g., 64KB
 	RestartInterval uint32 // Number of keys between restart points within a data block
 	WyhashSeed      uint64 // Seed for wyhash checksums
-	EncryptionKey   []byte // 32-byte AES-256 key
 }
 
 // BlockHeader contains metadata for each data block.
 type BlockHeader struct {
-	CompressionType   CompressionType
+	CompressionType      CompressionType
 	InitializationVector [12]byte // 12-byte unique IV for AES-GCM
 	AuthenticationTag    [16]byte // 16-byte GCM tag
 }

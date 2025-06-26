@@ -19,16 +19,17 @@ func TestWriterAndReader(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := new(bytes.Buffer)
 
+			encryptionKey := []byte(DefaultEncryptionKeyStr) // Use the default key for testing
+
 			configs := SSTableConfigs{
 				CompressionType: tt.compression,
 				BlockSize:       64 << 10, // 64KB
 				RestartInterval: 16,
 				WyhashSeed:      0, // Fixed seed for deterministic tests
-				EncryptionKey:   make([]byte, 32), // Dummy 32-byte key for testing
 			}
 
 			// Test Writer
-			writer := NewWriter(buf, configs)
+			writer := NewWriter(buf, configs, encryptionKey)
 			kvs := []KVEntry{
 				{Key: []byte("apple"), Value: []byte("red")},
 				{Key: []byte("banana"), Value: []byte("yellow")},
@@ -50,7 +51,7 @@ func TestWriterAndReader(t *testing.T) {
 			}
 
 			// Test Reader
-			reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+			reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey)
 			if err != nil {
 				t.Fatalf("NewReader() error = %v", err)
 			}

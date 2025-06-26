@@ -1,4 +1,3 @@
-
 package dsst
 
 import (
@@ -16,14 +15,15 @@ import (
 
 // Reader allows searching for keys within an SST file.
 type Reader struct {
-	r       io.ReaderAt
-	footer  SSTFooter
-	index   []indexEntry
-	configs SSTableConfigs
+	r             io.ReaderAt
+	footer        SSTFooter
+	index         []indexEntry
+	configs       SSTableConfigs
+	encryptionKey []byte
 }
 
 // NewReader initializes a new SST reader.
-func NewReader(r io.ReaderAt, size int64) (*Reader, SSTableConfigs, error) {
+func NewReader(r io.ReaderAt, size int64, encryptionKey []byte) (*Reader, SSTableConfigs, error) {
 	footer, err := readFooter(r, size)
 	if err != nil {
 		return nil, SSTableConfigs{}, fmt.Errorf("failed to read footer: %w", err)
@@ -40,10 +40,11 @@ func NewReader(r io.ReaderAt, size int64) (*Reader, SSTableConfigs, error) {
 	}
 
 	return &Reader{
-		r:       r,
-		footer:  footer,
-		index:   index,
-		configs: configs,
+		r:             r,
+		footer:        footer,
+		index:         index,
+		configs:       configs,
+		encryptionKey: encryptionKey,
 	}, configs, nil
 }
 
@@ -81,7 +82,6 @@ func readFooter(r io.ReaderAt, size int64) (SSTFooter, error) {
 
 	return footer, nil
 }
-
 func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, error) {
 	buf := make([]byte, handle.size)
 	_, err := r.ReadAt(buf, int64(handle.offset))
@@ -106,11 +106,6 @@ func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, erro
 	}
 	if err := binary.Read(reader, binary.LittleEndian, &configs.WyhashSeed); err != nil {
 		return SSTableConfigs{}, fmt.Errorf("failed to read wyhash seed: %w", err)
-	}
-
-	configs.EncryptionKey = make([]byte, 32) // AES-256 key is 32 bytes
-	if _, err := io.ReadFull(reader, configs.EncryptionKey); err != nil {
-		return SSTableConfigs{}, fmt.Errorf("failed to read encryption key: %w", err)
 	}
 
 	return configs, nil
@@ -187,7 +182,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	encryptedData := rawBlock[29 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV + 16 bytes for AuthTag
 
 	// Decrypt the data
-	blockCipher, err := aes.NewCipher(rd.configs.EncryptionKey)
+	blockCipher, err := aes.NewCipher(rd.encryptionKey)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to create AES cipher: %w", err)
 	}

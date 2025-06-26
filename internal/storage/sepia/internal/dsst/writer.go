@@ -1,4 +1,3 @@
-
 package dsst
 
 import (
@@ -16,6 +15,8 @@ import (
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 
+const DefaultEncryptionKeyStr = "00112233445566778899AABBCCDDEEFF"
+
 // Writer facilitates the creation of an SST file in a streaming manner.
 type Writer struct {
 	w               *bufio.Writer
@@ -27,14 +28,16 @@ type Writer struct {
 	entryCounter    int
 	configs         SSTableConfigs
 	firstKeyInBlock []byte
+	encryptionKey   []byte
 }
 
 // NewWriter creates a new SST writer.
-func NewWriter(w io.Writer, configs SSTableConfigs) *Writer {
+func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte) *Writer {
 	return &Writer{
-		w:            bufio.NewWriter(w),
-		dataBlockBuf: new(bytes.Buffer),
-		configs:      configs,
+		w:             bufio.NewWriter(w),
+		dataBlockBuf:  new(bytes.Buffer),
+		configs:       configs,
+		encryptionKey: encryptionKey,
 	}
 }
 
@@ -135,7 +138,7 @@ func (wr *Writer) writeDataBlock(blockBuf *bytes.Buffer, restartPoints []uint32)
 	}
 
 	// Encrypt the compressed data
-	blockCipher, err := aes.NewCipher(wr.configs.EncryptionKey)
+	blockCipher, err := aes.NewCipher(wr.encryptionKey)
 	if err != nil {
 		return blockHandle{}, fmt.Errorf("failed to create AES cipher: %w", err)
 	}
@@ -209,7 +212,6 @@ func (wr *Writer) writeMetaindexBlock() (blockHandle, error) {
 	binary.Write(buf, binary.LittleEndian, wr.configs.BlockSize)
 	binary.Write(buf, binary.LittleEndian, wr.configs.RestartInterval)
 	binary.Write(buf, binary.LittleEndian, wr.configs.WyhashSeed)
-	buf.Write(wr.configs.EncryptionKey)
 
 	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(buf, binary.LittleEndian, checksum)

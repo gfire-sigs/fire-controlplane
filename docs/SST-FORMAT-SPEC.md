@@ -87,7 +87,7 @@ Each data block is prefixed with a fixed-size header containing metadata about t
 | initialization_vector     | 12-byte unique IV for AES-GCM encryption.           |
 | authentication_tag        | 16-byte GCM tag for authenticated encryption.       |
 
-### 5.2 Entry Encoding
+### 5.1 Entry Encoding
 
 Each entry encodes:
 
@@ -101,23 +101,21 @@ Each entry encodes:
 
 - The first entry in a block has `shared_prefix_len = 0`.
 
-### 5.3 Restart Points
+### 5.2 Restart Points
 
 - Full keys are stored at regular intervals (e.g., every 16 entries).
 - Restart points enable fast seeking within a block.
 - A list of restart offsets is stored at the end of each block.
 
-### 5.4 Block Trailer
+### 5.3 Block Trailer
 
 The trailer contains:
 
 | Field                     | Description                     |
 |---------------------------|---------------------------------|
-| restart_point_count       | Number of restart points        |
 | restart_point_offsets[]   | List of restart offsets         |
-| initialization_vector     | 12-byte unique IV (if encrypted)|
-| authentication_tag        | 16-byte GCM tag (if encrypted)  |
-| block_checksum (optional) | 8-byte wyhash checksum (covers block header + compressed data + restart points + restart point count) |
+| restart_point_count       | Number of restart points        |
+| block_checksum | 8-byte wyhash checksum (covers block header + compressed data + restart points + restart point count) |
 
 ---
 
@@ -129,7 +127,7 @@ The index block contains entries mapping key ranges to data block offsets. Typic
 
 ## 7. Metaindex Block
 
-The metaindex block currently stores the `SSTableConfigs` structure, which defines the global configuration parameters for the SST file. In future versions, it may be extended to include pointers to other auxiliary metadata, such as filter blocks or properties.
+The metaindex block currently stores the `SSTableConfigs` structure, which defines the global configuration parameters for the SST file.
 
 | Field             | Description                                         |
 |-------------------|-----------------------------------------------------|
@@ -137,7 +135,6 @@ The metaindex block currently stores the `SSTableConfigs` structure, which defin
 | BlockSize         | 4-byte unsigned integer representing the target size for data blocks in bytes (e.g., 64KB). |
 | RestartInterval   | 4-byte unsigned integer representing the number of keys between restart points within a data block. |
 | WyhashSeed        | 8-byte unsigned integer used as the seed for wyhash checksums throughout the file. |
-| EncryptionKey     | 32-byte AES-256 key used for block encryption. If unencrypted, a dummy key (e.g., all zeros) is used. |
 
 ---
 
@@ -165,18 +162,13 @@ Filter blocks, such as Bloom filters, may be included to quickly rule out non-ex
 
 ### 9.3 Encryption
 
-Data blocks are always encrypted using AES-GCM-256. If unencrypted storage is desired, a dummy key (e.g., a 32-byte zero key) is used for encryption. The encryption parameters are as follows:
+Data blocks are always encrypted using AES-GCM-256. The encryption key is provided to the reader and writer at runtime and is not stored in the SST file.
 
-- **Key Derivation**: HKDF-SHA256 with:
-  - Master key (32 bytes)
-  - Per-file salt (16 bytes random)
-  - Context string "sst_encryption"
 - **IV Generation**: 12-byte random nonce per block
 - **Authentication**: 16-byte GCM tag per block
-- **Header Fields**:
-  - Encryption algorithm (1 byte)
-  - Key derivation salt (16 bytes)
-  - KDF iteration count (4 bytes)
+- **Header Fields**
+  - `initialization_vector` (12 bytes)
+  - `authentication_tag` (16 bytes)
 
 ---
 
