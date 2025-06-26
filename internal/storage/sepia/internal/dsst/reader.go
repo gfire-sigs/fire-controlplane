@@ -224,15 +224,57 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	numRestartPoints := binary.LittleEndian.Uint32(decodedBlock[len(decodedBlock)-4:])
 	restartPointsStart := len(decodedBlock) - 4 - int(numRestartPoints)*4
 
-	// Create a reader for the actual key-value data, excluding restart points and their count
-	dataReader := bytes.NewReader(decodedBlock[:restartPointsStart])
+	restartPoints := make([]uint32, numRestartPoints)
+	for i := 0; i < int(numRestartPoints); i++ {
+		restartPoints[i] = binary.LittleEndian.Uint32(decodedBlock[restartPointsStart+i*4 : restartPointsStart+(i+1)*4])
+	}
 
-	// Decode the block and search for the key
+	// Find the starting offset using binary search on restart points
+	startEntryOffset := uint32(0) // Default to start from the beginning of the block
+	if numRestartPoints > 0 {
+		low, high := 0, int(numRestartPoints)-1
+		for low <= high {
+			mid := (low + high) / 2
+			currentOffset := restartPoints[mid]
+
+			tempReader := bytes.NewReader(decodedBlock[:restartPointsStart])
+			tempReader.Seek(int64(currentOffset), io.SeekStart)
+
+			// Decode the key at the restart point (prevKey is nil for restart points)
+			kv, err := decodeEntry(tempReader, nil)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to decode entry at restart point %d: %w", mid, err)
+			}
+
+			cmp := bytes.Compare(key, kv.Key)
+			if cmp < 0 {
+				high = mid - 1
+			} else {
+				startEntryOffset = currentOffset
+				low = mid + 1
+			}
+		}
+	}
+
+	dataReader := bytes.NewReader(decodedBlock[:restartPointsStart])
+	dataReader.Seek(int64(startEntryOffset), io.SeekStart)
+
 	var prevKey []byte
+	// If we started from a non-zero offset, we need to re-decode entries from that offset
+	// until we find the target key or pass it.
+	// The `prevKey` for the first entry after seeking will be `nil` because restart points reset prefix compression.
+	// Subsequent `prevKey` values will be correctly updated by the loop.
+
 	for dataReader.Len() > 0 {
 		kv, err := decodeEntry(dataReader, prevKey)
 		if err != nil {
 			return nil, false, err
+		}
+
+		// If the current key is greater than the target key, then the target key is not in this block.
+		// This check is crucial for correctness after binary search.
+		if bytes.Compare(kv.Key, key) > 0 {
+			return nil, false, nil
 		}
 
 		if bytes.Equal(kv.Key, key) {

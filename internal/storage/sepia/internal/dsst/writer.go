@@ -51,11 +51,18 @@ func (wr *Writer) Add(key, value []byte) error {
 		wr.firstKeyInBlock = key
 	}
 
+	// Determine the prevKey for encoding.
+	// If it's a restart point, we treat prevKey as empty to ensure sharedPrefixLen is 0.
+	// Otherwise, use the actual previous key.
+	var encodePrevKey []byte
 	if wr.entryCounter%int(wr.configs.RestartInterval) == 0 {
 		wr.restartPoints = append(wr.restartPoints, uint32(wr.dataBlockBuf.Len()))
+		encodePrevKey = []byte{} // For restart points, sharedPrefixLen should be 0
+	} else {
+		encodePrevKey = wr.prevKey
 	}
 
-	encodeEntry(wr.dataBlockBuf, wr.prevKey, KVEntry{Key: key, Value: value})
+	encodeEntry(wr.dataBlockBuf, encodePrevKey, KVEntry{Key: key, Value: value})
 	wr.prevKey = append(wr.prevKey[:0], key...)
 	wr.entryCounter++
 

@@ -2,6 +2,7 @@ package dsst
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 )
 
@@ -30,14 +31,12 @@ func TestWriterAndReader(t *testing.T) {
 
 			// Test Writer
 			writer := NewWriter(buf, configs, encryptionKey)
-			kvs := []KVEntry{
-				{Key: []byte("apple"), Value: []byte("red")},
-				{Key: []byte("banana"), Value: []byte("yellow")},
-				{Key: []byte("cherry"), Value: []byte("red")},
-				{Key: []byte("date"), Value: []byte("brown")},
-				{Key: []byte("elderberry"), Value: []byte("dark purple")},
-				{Key: []byte("fig"), Value: []byte("purple")},
-				{Key: []byte("grape"), Value: []byte("purple")},
+			var kvs []KVEntry
+			// Generate a larger set of keys to ensure multiple blocks and restart points
+			for i := 0; i < 100; i++ {
+				key := []byte(fmt.Sprintf("key%03d", i))
+				value := []byte(fmt.Sprintf("value%03d", i*10))
+				kvs = append(kvs, KVEntry{Key: key, Value: value})
 			}
 
 			for _, kv := range kvs {
@@ -70,13 +69,23 @@ func TestWriterAndReader(t *testing.T) {
 				}
 			}
 
-			// Check for non-existent key
-			_, found, err := reader.Get([]byte("guava"))
-			if err != nil {
-				t.Fatalf("Reader.Get(\"guava\") error = %v", err)
+			// Check for non-existent keys
+			nonExistentKeys := []string{
+				"key000a", // Between existing keys
+				"key050a",
+				"key100",  // After all keys
+				"akey",    // Before all keys
+				"key0000", // Shorter than existing keys
+				"key00000", // Longer than existing keys
 			}
-			if found {
-				t.Errorf("Reader.Get(\"guava\") found = true, want false")
+			for _, nk := range nonExistentKeys {
+				_, found, err := reader.Get([]byte(nk))
+				if err != nil {
+					t.Fatalf("Reader.Get(%q) error = %v", nk, err)
+				}
+				if found {
+					t.Errorf("Reader.Get(%q) found = true, want false", nk)
+				}
 			}
 		})
 	}
