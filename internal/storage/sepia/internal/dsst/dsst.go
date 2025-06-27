@@ -15,6 +15,14 @@ const (
 	CompressionTypeZstd
 )
 
+//go:generate stringer -type=EntryType
+type EntryType byte
+
+const (
+	EntryTypeKeyValue EntryType = iota
+	EntryTypeTombstone
+)
+
 // Constants defining the SST file format structure and flags based on the RFC.
 const (
 	// SST_V1_MAGIC is used in the file footer to identify the file format and version.
@@ -42,8 +50,9 @@ type BlockHeader struct {
 
 // KVEntry represents a single key-value pair.
 type KVEntry struct {
-	Key   []byte
-	Value []byte
+	EntryType EntryType
+	Key       []byte
+	Value     []byte
 }
 
 // blockHandle stores the location (offset) and size of a block within the SST file.
@@ -69,7 +78,9 @@ type indexEntry struct {
 
 // encodeEntry encodes a single KV entry according to the RFC 5.1 specification.
 func encodeEntry(buf *bytes.Buffer, prevKey []byte, entry KVEntry) {
-	sharedPrefixLen := commonPrefix(prevKey, entry.Key)
+	buf.WriteByte(byte(entry.EntryType))
+
+	sharedPrefixLen := dsstCommonPrefix(prevKey, entry.Key)
 	unsharedKey := entry.Key[sharedPrefixLen:]
 
 	var uvarintBuf [binary.MaxVarintLen64]byte
@@ -79,15 +90,19 @@ func encodeEntry(buf *bytes.Buffer, prevKey []byte, entry KVEntry) {
 	n = binary.PutUvarint(uvarintBuf[:], uint64(len(unsharedKey)))
 	buf.Write(uvarintBuf[:n])
 
-	n = binary.PutUvarint(uvarintBuf[:], uint64(len(entry.Value)))
-	buf.Write(uvarintBuf[:n])
+	if entry.EntryType == EntryTypeKeyValue {
+		n = binary.PutUvarint(uvarintBuf[:], uint64(len(entry.Value)))
+		buf.Write(uvarintBuf[:n])
+	}
 
 	buf.Write(unsharedKey)
-	buf.Write(entry.Value)
+	if entry.EntryType == EntryTypeKeyValue {
+		buf.Write(entry.Value)
+	}
 }
 
-// commonPrefix finds the length of the common prefix between two byte slices.
-func commonPrefix(a, b []byte) int {
+// dsstCommonPrefix finds the length of the common prefix between two byte slices.
+func dsstCommonPrefix(a, b []byte) int {
 	i := 0
 	for i < len(a) && i < len(b) && a[i] == b[i] {
 		i++
@@ -95,20 +110,37 @@ func commonPrefix(a, b []byte) int {
 	return i
 }
 
-func decodeEntry(r *bytes.Reader, prevKey []byte) (KVEntry, error) {
+// dsstKVEntry represents a key-value pair for internal use.
+type dsstKVEntry struct {
+	EntryType EntryType
+	Key       []byte
+	Value     []byte
+}
+
+// dsstDecodeEntry decodes a key-value entry from the given reader.
+func dsstDecodeEntry(r *bytes.Reader, prevKey []byte) (dsstKVEntry, error) {
+	entryTypeByte, err := r.ReadByte()
+	if err != nil {
+		return dsstKVEntry{}, err
+	}
+	entryType := EntryType(entryTypeByte)
+
 	sharedPrefixLen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return KVEntry{}, err
+		return dsstKVEntry{}, err
 	}
 
 	unsharedKeyLen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return KVEntry{}, err
+		return dsstKVEntry{}, err
 	}
 
-	valueLen, err := binary.ReadUvarint(r)
-	if err != nil {
-		return KVEntry{}, err
+	var valueLen uint64
+	if entryType == EntryTypeKeyValue {
+		valueLen, err = binary.ReadUvarint(r)
+		if err != nil {
+			return dsstKVEntry{}, err
+		}
 	}
 
 	key := make([]byte, sharedPrefixLen+unsharedKeyLen)
@@ -116,14 +148,17 @@ func decodeEntry(r *bytes.Reader, prevKey []byte) (KVEntry, error) {
 
 	unsharedKey := make([]byte, unsharedKeyLen)
 	if _, err := io.ReadFull(r, unsharedKey); err != nil {
-		return KVEntry{}, err
+		return dsstKVEntry{}, err
 	}
 	copy(key[sharedPrefixLen:], unsharedKey)
 
-	value := make([]byte, valueLen)
-	if _, err := io.ReadFull(r, value); err != nil {
-		return KVEntry{}, err
+	var value []byte
+	if entryType == EntryTypeKeyValue {
+		value = make([]byte, valueLen)
+		if _, err := io.ReadFull(r, value); err != nil {
+			return dsstKVEntry{}, err
+		}
 	}
 
-	return KVEntry{Key: key, Value: value}, nil
+	return dsstKVEntry{EntryType: entryType, Key: key, Value: value}, nil
 }

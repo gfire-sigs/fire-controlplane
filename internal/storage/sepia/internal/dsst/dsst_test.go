@@ -40,7 +40,7 @@ func TestWriterAndReader(t *testing.T) {
 			}
 
 			for _, kv := range kvs {
-				if err := writer.Add(kv.Key, kv.Value); err != nil {
+				if err := writer.Add(kv); err != nil {
 					t.Fatalf("Writer.Add() error = %v", err)
 				}
 			}

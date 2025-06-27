@@ -37,7 +37,7 @@ func BenchmarkWriterAdd(b *testing.B) {
 		buf := new(bytes.Buffer)
 		writer := NewWriter(buf, configs, encryptionKey)
 		for _, kv := range kvs {
-			if err := writer.Add(kv.Key, kv.Value); err != nil {
+			if err := writer.Add(kv); err != nil {
 				b.Fatalf("Writer.Add() error = %v", err)
 			}
 		}
@@ -83,7 +83,7 @@ func BenchmarkReaderGet(b *testing.B) {
 
 	writer := NewWriter(buf, configs, encryptionKey)
 	for _, kv := range kvs {
-		if err := writer.Add(kv.Key, kv.Value); err != nil {
+		if err := writer.Add(kv); err != nil {
 			b.Fatalf("Writer.Add() error = %v", err)
 		}
 	}

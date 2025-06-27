@@ -200,37 +200,53 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 	next := g.getNode(log[0]).nexts[0]
 	if next != marena.ARENA_INVALID_ADDRESS && g.compare(key, g.arena.View(g.getNode(next).keyPtr)) == 0 {
 		// Key exists - update value
-		newValue := g.arena.Allocate(len(value))
-		if newValue == marena.ARENA_INVALID_ADDRESS {
-			return marena.ARENA_INVALID_ADDRESS
+		if value == nil {
+			g.getNode(next).valuePtr = marena.ARENA_INVALID_ADDRESS // Mark as deleted
+		} else {
+			newValueAddr := g.arena.Allocate(len(value))
+			if newValueAddr == marena.ARENA_INVALID_ADDRESS {
+				return marena.ARENA_INVALID_ADDRESS
+			}
+			copy(g.arena.View(newValueAddr), value)
+			g.getNode(next).valuePtr = newValueAddr
 		}
-		copy(g.arena.View(newValue), value)
-		g.getNode(next).valuePtr = newValue
 		return next
 	}
 
 	// Generate random level and allocate memory for new node
 	level := g.randLevel()
-	var newNode, newValue, newKey uint64 = uint64(sizeNode(level)), uint64(len(value)), uint64(len(key))
-	if !g.arena.AllocateMultiple(&newNode, &newValue, &newKey) {
+	
+	var newNodeSize uint64 = uint64(sizeNode(level))
+	var newKeySize uint64 = uint64(len(key))
+
+	// Allocate for node and key first
+	if !g.arena.AllocateMultiple(&newNodeSize, &newKeySize) {
 		return marena.ARENA_INVALID_ADDRESS
 	}
 
-	// Initialize new node
-	node := g.getNode(marena.Offset(newNode))
+	node := g.getNode(marena.Offset(newNodeSize))
 	node.level = level
-	node.keyPtr = newKey
-	node.valuePtr = newValue
+	node.keyPtr = newKeySize
 	copy(g.arena.View(node.keyPtr), key)
-	copy(g.arena.View(node.valuePtr), value)
+
+	if value == nil {
+		node.valuePtr = marena.ARENA_INVALID_ADDRESS // Mark as deleted
+	} else {
+		newValueAddr := g.arena.Allocate(len(value))
+		if newValueAddr == marena.ARENA_INVALID_ADDRESS {
+			return marena.ARENA_INVALID_ADDRESS
+		}
+		copy(g.arena.View(newValueAddr), value)
+		node.valuePtr = newValueAddr
+	}
 
 	// Update next pointers at each level
 	for i := int32(0); i < level; i++ {
 		node.nexts[i] = g.getNode(log[i]).nexts[i]          // Set new node's next pointer
-		g.getNode(log[i]).nexts[i] = marena.Offset(newNode) // Update previous node's next pointer
+		g.getNode(log[i]).nexts[i] = marena.Offset(newNodeSize) // Update previous node's next pointer
 	}
 
-	return marena.Offset(newNode)
+	return marena.Offset(newNodeSize)
 }
 
 // Insert adds a new key-value pair to the skiplist or updates an existing one.
@@ -289,15 +305,33 @@ func (g *SkipListIterator) SeekLT(key []byte) {
 // becomes invalid.
 func (g *SkipListIterator) SeekLE(key []byte) {
 	var log [MSKIP_MAX_LEVEL]uint32
-	g.current = g.skl.seeklt(key, &log)
-	if !g.Valid() {
+	// Find the node whose key is strictly less than 'key'.
+	// This will be the node *before* the one we are looking for, or the head.
+	prevNodePtr := g.skl.seeklt(key, &log)
+
+	// If prevNodePtr is the head, it means all keys in the skiplist are >= 'key'.
+	// In this case, we need to check if the first element is equal to 'key'.
+	if prevNodePtr == g.skl.head {
+		firstNodePtr := g.skl.getNode(g.skl.head).nexts[0]
+		if firstNodePtr != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(firstNodePtr).keyPtr)) == 0 {
+			g.current = firstNodePtr
+		} else {
+			g.current = marena.ARENA_INVALID_ADDRESS // No key <= 'key' found
+		}
 		return
 	}
 
-	next := g.skl.getNode(g.current).nexts[0]
-	if next != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(next).keyPtr)) == 0 {
-		g.current = next
+	// If prevNodePtr is not the head, it means we found a node whose key is < 'key'.
+	// Now, check the node *after* prevNodePtr. This might be the 'key' itself.
+	g.current = prevNodePtr // Start by pointing to the node found by seeklt
+
+	// Check if the next node is equal to 'key'.
+	nextNodePtr := g.skl.getNode(g.current).nexts[0]
+	if nextNodePtr != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(nextNodePtr).keyPtr)) == 0 {
+		g.current = nextNodePtr // Move to the exact match
 	}
+	// If nextNodePtr is not an exact match, g.current remains prevNodePtr, which is the largest key <= 'key'.
+	// This is the correct behavior for SeekLE.
 }
 
 // Valid returns true if the iterator is positioned at a valid node in the skiplist.
@@ -313,8 +347,14 @@ func (g *SkipListIterator) Next() {
 		return
 	}
 
-	node := g.skl.getNode(g.current)
-	g.current = node.nexts[0]
+	// Advance until a non-tombstone entry is found or end of list is reached.
+	for {
+		node := g.skl.getNode(g.current)
+		g.current = node.nexts[0]
+		if !g.Valid() || g.Value() != nil {
+			break // Found a valid entry or reached end of list
+		}
+	}
 }
 
 // Prev moves the iterator to the previous key in the skiplist.
@@ -352,7 +392,21 @@ func (g *SkipListIterator) Value() []byte {
 	}
 
 	node := g.skl.getNode(g.current)
+	if node.valuePtr == marena.ARENA_INVALID_ADDRESS {
+		return nil
+	}
 	return g.skl.arena.View(node.valuePtr)
+}
+
+// Seek moves the iterator to the first key that is greater than or equal to the given key.
+func (g *SkipListIterator) Seek(key []byte) {
+	g.SeekLE(key)
+	// After SeekLE, if the current key is less than the target key,
+	// we need to advance to the next key. This handles cases where SeekLE
+	// positions the iterator at a key *less than* the target key.
+	if g.Valid() && g.skl.compare(g.Key(), key) < 0 {
+		g.Next()
+	}
 }
 
 // Close releases the iterator's resources and returns it to the pool.

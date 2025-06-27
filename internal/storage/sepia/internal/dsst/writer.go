@@ -42,13 +42,13 @@ func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte) *Write
 }
 
 // Add appends a key-value pair to the current data block.
-func (wr *Writer) Add(key, value []byte) error {
-	if wr.prevKey != nil && bytes.Compare(wr.prevKey, key) >= 0 {
+func (wr *Writer) Add(entry KVEntry) error {
+	if wr.prevKey != nil && bytes.Compare(wr.prevKey, entry.Key) >= 0 {
 		return fmt.Errorf("keys must be added in ascending order")
 	}
 
 	if wr.dataBlockBuf.Len() == 0 {
-		wr.firstKeyInBlock = key
+		wr.firstKeyInBlock = entry.Key
 	}
 
 	// Determine the prevKey for encoding.
@@ -62,8 +62,8 @@ func (wr *Writer) Add(key, value []byte) error {
 		encodePrevKey = wr.prevKey
 	}
 
-	encodeEntry(wr.dataBlockBuf, encodePrevKey, KVEntry{Key: key, Value: value})
-	wr.prevKey = append(wr.prevKey[:0], key...)
+	encodeEntry(wr.dataBlockBuf, encodePrevKey, entry)
+	wr.prevKey = append(wr.prevKey[:0], entry.Key...)
 	wr.entryCounter++
 
 	if wr.dataBlockBuf.Len() >= int(wr.configs.BlockSize) {
@@ -99,6 +99,8 @@ func (wr *Writer) Finish() error {
 	return wr.w.Flush()
 }
 
+// finishDataBlock encapsulates the process of completing a data block,
+// including compression, encryption, and writing to the output.
 func (wr *Writer) finishDataBlock() error {
 	handle, err := wr.writeDataBlock(wr.dataBlockBuf, wr.restartPoints)
 	if err != nil {

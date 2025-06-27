@@ -241,7 +241,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 			tempReader.Seek(int64(currentOffset), io.SeekStart)
 
 			// Decode the key at the restart point (prevKey is nil for restart points)
-			kv, err := decodeEntry(tempReader, nil)
+			kv, err := dsstDecodeEntry(tempReader, nil)
 			if err != nil {
 				return nil, false, fmt.Errorf("failed to decode entry at restart point %d: %w", mid, err)
 			}
@@ -266,7 +266,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	// Subsequent `prevKey` values will be correctly updated by the loop.
 
 	for dataReader.Len() > 0 {
-		kv, err := decodeEntry(dataReader, prevKey)
+		kv, err := dsstDecodeEntry(dataReader, prevKey)
 		if err != nil {
 			return nil, false, err
 		}
@@ -278,6 +278,9 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 		}
 
 		if bytes.Equal(kv.Key, key) {
+			if kv.EntryType == EntryTypeTombstone {
+				return nil, false, nil // Found a tombstone, key is deleted
+			}
 			return kv.Value, true, nil
 		}
 		prevKey = kv.Key
@@ -309,3 +312,240 @@ func decodeIndexEntry(r *bytes.Reader) (indexEntry, error) {
 
 	return indexEntry{firstKey: key, blockHandle: blockHandle{offset: offset, size: size}}, nil
 }
+
+// Iterator allows iterating over the key-value pairs in an SST file.
+type Iterator struct {
+	rd           *Reader
+	blockIndex   int // Current block index in rd.index
+	blockIter    *bytes.Reader
+	currentKV    *dsstKVEntry
+	prevKey      []byte
+	decodedBlock []byte // Store the decoded block data
+	// restartPoints stores the offsets of restart points within the current block.
+	restartPoints []uint32
+	// currentRestartPointIndex is the index of the current restart point within the restartPoints slice.
+	currentRestartPointIndex int
+	restartPointsStart       int // Start offset of restart points in decodedBlock
+}
+
+// NewIterator creates a new iterator for the Reader.
+func (rd *Reader) Iterator() *Iterator {
+	return &Iterator{
+		rd: rd,
+	}
+}
+
+// First positions the iterator at the first key in the SST file.
+func (it *Iterator) First() {
+	if len(it.rd.index) == 0 {
+		it.blockIndex = -1
+		return
+	}
+	it.blockIndex = 0
+	it.loadBlock()
+	it.Next() // Position at the first element
+}
+
+// Valid returns true if the iterator is positioned at a valid element.
+func (it *Iterator) Valid() bool {
+	return it.currentKV != nil
+}
+
+// Next moves the iterator to the next key.
+func (it *Iterator) Next() {
+	// If the current block iterator is exhausted, move to the next block.
+	if it.blockIter == nil || it.blockIter.Len() == 0 {
+		it.blockIndex++
+		if it.blockIndex >= len(it.rd.index) {
+			it.currentKV = nil // No more blocks, invalidate iterator.
+			return
+		}
+		it.loadBlock()
+		it.prevKey = nil // Reset prevKey for new block.
+		it.currentRestartPointIndex = 0
+	}
+
+	// Decode the next entry from the current block.
+	kv, err := dsstDecodeEntry(it.blockIter, it.prevKey)
+	if err != nil {
+		it.currentKV = nil // Invalidate iterator on error.
+		return
+	}
+	it.currentKV = &kv
+	it.prevKey = kv.Key
+}
+
+// Key returns the key at the current iterator position.
+func (it *Iterator) Key() []byte {
+	if it.currentKV == nil {
+		return nil
+	}
+	return it.currentKV.Key
+}
+
+// Value returns the value at the current iterator position.
+func (it *Iterator) Value() []byte {
+	if it.currentKV == nil || it.currentKV.EntryType == EntryTypeTombstone {
+		return nil
+	}
+	return it.currentKV.Value
+}
+
+// Close releases the iterator's resources.
+func (it *Iterator) Close() {
+	// No explicit resources to close for now
+}
+
+// Seek moves the iterator to the first key that is greater than or equal to the given key.
+func (it *Iterator) Seek(key []byte) {
+	// Find the block that might contain the key.
+	blockHandle, found := it.rd.findDataBlock(key)
+	if !found {
+		it.currentKV = nil
+		return
+	}
+
+	// Find the index of the block.
+	for i, entry := range it.rd.index {
+		if entry.blockHandle == blockHandle {
+			it.blockIndex = i
+			break
+		}
+	}
+
+	it.loadBlock()
+
+	// Binary search within the restart points to find the closest restart point.
+	low, high := 0, len(it.restartPoints)-1
+	startEntryOffset := uint32(0)
+	for low <= high {
+		mid := (low + high) / 2
+		currentOffset := it.restartPoints[mid]
+
+		tempReader := bytes.NewReader(it.decodedBlock[:it.restartPointsStart]) // Use the stored decodedBlock
+		tempReader.Seek(int64(currentOffset), io.SeekStart)
+
+		kv, err := dsstDecodeEntry(tempReader, nil) // prevKey is nil for restart points
+		if err != nil {
+			it.currentKV = nil
+			return
+		}
+
+		cmp := bytes.Compare(key, kv.Key)
+		if cmp <= 0 {
+			startEntryOffset = currentOffset
+			high = mid - 1
+		} else {
+			startEntryOffset = currentOffset
+			low = mid + 1
+		}
+	}
+
+	it.blockIter.Seek(int64(startEntryOffset), io.SeekStart)
+	it.prevKey = nil // Reset prevKey after seeking within the block.
+
+	// Iterate from the restart point until the key is found or passed.
+	for it.blockIter.Len() > 0 {
+		kv, err := dsstDecodeEntry(it.blockIter, it.prevKey)
+		if err != nil {
+			it.currentKV = nil
+			return
+		}
+		it.currentKV = &kv
+		it.prevKey = kv.Key
+
+		if bytes.Compare(it.currentKV.Key, key) >= 0 {
+			return // Found the key or the first key greater than it.
+		}
+	}
+
+	// If we reached the end of the block and didn't find the key, move to the next.
+	it.Next()
+}
+
+func (it *Iterator) loadBlock() {
+	handle := it.rd.index[it.blockIndex].blockHandle
+	rawBlock := make([]byte, handle.size)
+	_, err := it.rd.r.ReadAt(rawBlock, int64(handle.offset))
+	if err != nil {
+		// Handle error, perhaps log and invalidate iterator
+		it.blockIter = nil
+		return
+	}
+
+	// Read block header
+	blockHeader := BlockHeader{
+		CompressionType: CompressionType(rawBlock[0]),
+	}
+	copy(blockHeader.InitializationVector[:], rawBlock[1:13])
+	copy(blockHeader.AuthenticationTag[:], rawBlock[13:13+aes.BlockSize])
+
+	// encryptedData starts after the header and ends before the checksum.
+	encryptedData := rawBlock[29 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV + 16 bytes for AuthTag
+
+	// Decrypt the data
+	blockCipher, err := aes.NewCipher(it.rd.encryptionKey)
+	if err != nil {
+		// Handle error
+		it.blockIter = nil
+		return
+	}
+	gcm, err := cipher.NewGCM(blockCipher)
+	if err != nil {
+		// Handle error
+		it.blockIter = nil
+		return
+	}
+
+	decryptedData, err := gcm.Open(nil, blockHeader.InitializationVector[:], append(encryptedData, blockHeader.AuthenticationTag[:]...), nil)
+	if err != nil {
+		// Handle error
+		it.blockIter = nil
+		return
+	}
+
+	var decodedBlock []byte
+	switch blockHeader.CompressionType {
+	case CompressionTypeSnappy:
+		decodedBlock, err = snappy.Decode(nil, decryptedData)
+		if err != nil {
+			// Handle error
+			it.blockIter = nil
+			return
+		}
+	case CompressionTypeZstd:
+		reader := bytes.NewReader(decryptedData)
+		zstdReader, err := zstd.NewReader(reader)
+		if err != nil {
+			// Handle error
+			it.blockIter = nil
+			return
+		}
+		defer zstdReader.Close()
+		decodedBlock, err = io.ReadAll(zstdReader)
+		if err != nil {
+			// Handle error
+			it.blockIter = nil
+			return
+		}
+	default:
+		decodedBlock = decryptedData
+	}
+
+	// Extract restart points and their count from the end of the decoded block
+	numRestartPoints := binary.LittleEndian.Uint32(decodedBlock[len(decodedBlock)-4:])
+	it.restartPoints = make([]uint32, numRestartPoints)
+	restartPointsStart := len(decodedBlock) - 4 - int(numRestartPoints)*4
+
+	for i := 0; i < int(numRestartPoints); i++ {
+		it.restartPoints[i] = binary.LittleEndian.Uint32(decodedBlock[restartPointsStart+i*4 : restartPointsStart+(i+1)*4])
+	}
+
+	// The blockIter should only contain the key-value entries, not restart points or checksum
+	it.decodedBlock = decodedBlock // Store the decoded block
+	it.restartPointsStart = restartPointsStart
+	it.blockIter = bytes.NewReader(it.decodedBlock[:it.restartPointsStart])
+	it.currentRestartPointIndex = 0
+}
+
+// NewMergeIterator creates a new iterator that merges multiple SSTable iterators.
