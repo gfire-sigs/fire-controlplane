@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"sort"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ func TestDBSimple(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024, // Small arena to trigger flushing
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -72,6 +74,7 @@ func TestDBEdgeCases(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024, // Small arena to trigger flushing
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -161,6 +164,7 @@ func TestDBFlush(t *testing.T) {
 		VFS:       vfs,
 		ArenaSize: 1024, // Small arena to trigger flushing
 		DataDir:   "database",
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -336,6 +340,7 @@ func TestDBDelete(t *testing.T) {
 		VFS:       vfs,
 		ArenaSize: 1024, // Small arena to trigger flushing
 		DataDir:   "database",
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -474,6 +479,7 @@ func BenchmarkDBPut(b *testing.B) {
 	opts := Options{
 		VFS:       memVFS,
 		ArenaSize: 64 * 1024 * 1024, // 64MB arena
+		Compare:   bytes.Compare,
 	}
 
 	b.ResetTimer()
@@ -503,6 +509,7 @@ func BenchmarkDBGet(b *testing.B) {
 	opts := Options{
 		VFS:       memVFS,
 		ArenaSize: 64 * 1024 * 1024, // 64MB arena
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -564,6 +571,7 @@ func TestDBConcurrency(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024 * 1024, // 1MB arena
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -608,6 +616,7 @@ func TestDBIteratorEdgeCases(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024,
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -631,6 +640,7 @@ func TestDBValueOverwrite(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024,
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -668,6 +678,7 @@ func TestDBPrefixScan(t *testing.T) {
 	opts := Options{
 		VFS:       vfs,
 		ArenaSize: 1024,
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {
@@ -706,11 +717,165 @@ func TestDBPrefixScan(t *testing.T) {
 	}
 }
 
+func TestDBCustomCompare(t *testing.T) {
+	vfs := vfs.NewMemVFS()
+	// Custom compare function for reverse order
+	reverseCompare := func(key1, key2 []byte) int {
+		return bytes.Compare(key2, key1) // Reverse order
+	}
+	opts := Options{
+		VFS:       vfs,
+		ArenaSize: 1024,
+		Compare:   reverseCompare,
+	}
+	db, err := NewDB(opts)
+	if err != nil {
+		t.Fatalf("NewDB failed: %v", err)
+	}
+	defer db.Close()
+
+	keys := [][]byte{
+		[]byte("apple"),
+		[]byte("banana"),
+		[]byte("cherry"),
+	}
+	values := [][]byte{
+		[]byte("red"),
+		[]byte("yellow"),
+		[]byte("pink"),
+	}
+
+	for i := 0; i < len(keys); i++ {
+		if err := db.Put(keys[i], values[i]); err != nil {
+			t.Fatalf("Put failed for key %s: %v", keys[i], err)
+		}
+	}
+
+	// Verify keys are retrieved in reverse order
+	expectedOrder := [][]byte{
+		[]byte("cherry"),
+		[]byte("banana"),
+		[]byte("apple"),
+	}
+
+	iter := db.Iterator()
+	defer iter.Close()
+
+	var retrievedKeys [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		retrievedKeys = append(retrievedKeys, iter.Key())
+	}
+
+	if len(retrievedKeys) != len(expectedOrder) {
+		t.Fatalf("Retrieved key count mismatch. Expected %d, got %d", len(expectedOrder), len(retrievedKeys))
+	}
+
+	for i := 0; i < len(expectedOrder); i++ {
+		if !bytes.Equal(retrievedKeys[i], expectedOrder[i]) {
+			t.Fatalf("Key order mismatch at index %d. Expected %s, got %s", i, expectedOrder[i], retrievedKeys[i])
+		}
+	}
+
+	// Verify Get works with custom compare
+	retrievedValue, ok, err := db.Get([]byte("banana"))
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("Get failed: key not found")
+	}
+	if !bytes.Equal(retrievedValue, []byte("yellow")) {
+		t.Fatalf("Get returned wrong value: got %s, want %s", retrievedValue, []byte("yellow"))
+	}
+}
+
+func TestDBCustomCompareWithFlush(t *testing.T) {
+	vfs := vfs.NewMemVFS()
+	// Custom compare function for reverse order
+	reverseCompare := func(key1, key2 []byte) int {
+		return bytes.Compare(key2, key1) // Reverse order
+	}
+	opts := Options{
+		VFS:       vfs,
+		ArenaSize: 1024, // Small arena to trigger flushing
+		DataDir:   "database_custom_flush",
+		Compare:   reverseCompare,
+	}
+	db, err := NewDB(opts)
+	if err != nil {
+		t.Fatalf("NewDB failed: %v", err)
+	}
+
+	numInsertions := 500 // Enough to trigger flushes with 1KB arena
+	insertedKeys := make([][]byte, numInsertions)
+	for i := 0; i < numInsertions; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		value := []byte(fmt.Sprintf("value-%d", i))
+		if err := db.Put(key, value); err != nil {
+			t.Fatalf("Put failed for key %s: %v", key, err)
+		}
+		insertedKeys[i] = key
+	}
+
+	// Explicitly close the DB to force a flush of the memtable to disk.
+	if err := db.Close(); err != nil {
+		t.Fatalf("DB Close failed: %v", err)
+	}
+
+	// Reopen the DB to read from the flushed SSTables
+	db, err = NewDB(opts)
+	if err != nil {
+		t.Fatalf("NewDB failed on reopen: %v", err)
+	}
+	defer db.Close()
+
+	// Verify keys are retrieved in reverse order
+	iter := db.Iterator()
+	defer iter.Close()
+
+	var retrievedKeys [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		retrievedKeys = append(retrievedKeys, iter.Key())
+	}
+
+	// Sort the original keys in reverse order to compare
+	expectedOrder := make([][]byte, numInsertions)
+	copy(expectedOrder, insertedKeys)
+	sort.Slice(expectedOrder, func(i, j int) bool {
+		return reverseCompare(expectedOrder[i], expectedOrder[j]) < 0
+	})
+
+	if len(retrievedKeys) != len(expectedOrder) {
+		t.Fatalf("Retrieved key count mismatch. Expected %d, got %d", len(expectedOrder), len(retrievedKeys))
+	}
+
+	for i := 0; i < len(expectedOrder); i++ {
+		if !bytes.Equal(retrievedKeys[i], expectedOrder[i]) {
+			t.Fatalf("Key order mismatch at index %d. Expected %s, got %s", i, expectedOrder[i], retrievedKeys[i])
+		}
+	}
+
+	// Verify Get works with custom compare after flush
+	testKey := []byte("key-000")
+	testValue := []byte("value-0")
+	retrievedValue, ok, err := db.Get(testKey)
+	if err != nil {
+		t.Fatalf("Get failed for %s: %v", testKey, err)
+	}
+	if !ok {
+		t.Fatalf("Get failed: key %s not found", testKey)
+	}
+	if !bytes.Equal(retrievedValue, testValue) {
+		t.Fatalf("Get returned wrong value for %s: got %s, want %s", testKey, retrievedValue, testValue)
+	}
+}
+
 func BenchmarkDBIterator(b *testing.B) {
 	memVFS := vfs.NewMemVFS()
 	opts := Options{
 		VFS:       memVFS,
 		ArenaSize: 64 * 1024 * 1024, // 64MB arena
+		Compare:   bytes.Compare,
 	}
 	db, err := NewDB(opts)
 	if err != nil {

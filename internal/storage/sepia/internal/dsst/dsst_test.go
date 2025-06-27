@@ -30,7 +30,7 @@ func TestWriterAndReader(t *testing.T) {
 			}
 
 			// Test Writer
-			writer := NewWriter(buf, configs, encryptionKey)
+			writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
 			var kvs []KVEntry
 			// Generate a larger set of keys to ensure multiple blocks and restart points
 			for i := 0; i < 100; i++ {
@@ -50,7 +50,7 @@ func TestWriterAndReader(t *testing.T) {
 			}
 
 			// Test Reader
-			reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey)
+			reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey, bytes.Compare)
 			if err != nil {
 				t.Fatalf("NewReader() error = %v", err)
 			}

@@ -35,7 +35,7 @@ func BenchmarkWriterAdd(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		buf := new(bytes.Buffer)
-		writer := NewWriter(buf, configs, encryptionKey)
+		writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
 		for _, kv := range kvs {
 			if err := writer.Add(kv); err != nil {
 				b.Fatalf("Writer.Add() error = %v", err)
@@ -49,7 +49,7 @@ func BenchmarkWriterAdd(b *testing.B) {
 
 	// Correctness check after all benchmark iterations
 	b.StopTimer() // Stop timer before correctness check
-	reader, _, err := NewReader(bytes.NewReader(finalBuf.Bytes()), int64(finalBuf.Len()), encryptionKey)
+	reader, _, err := NewReader(bytes.NewReader(finalBuf.Bytes()), int64(finalBuf.Len()), encryptionKey, bytes.Compare)
 	if err != nil {
 		b.Fatalf("Failed to create reader for correctness check: %v", err)
 	}
@@ -81,7 +81,7 @@ func BenchmarkReaderGet(b *testing.B) {
 	}
 	encryptionKey := []byte(DefaultEncryptionKeyStr)
 
-	writer := NewWriter(buf, configs, encryptionKey)
+	writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
 	for _, kv := range kvs {
 		if err := writer.Add(kv); err != nil {
 			b.Fatalf("Writer.Add() error = %v", err)
@@ -91,7 +91,7 @@ func BenchmarkReaderGet(b *testing.B) {
 		b.Fatalf("Writer.Finish() error = %v", err)
 	}
 
-	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey)
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey, bytes.Compare)
 	if err != nil {
 		b.Fatalf("Failed to create reader: %v", err)
 	}

@@ -41,6 +41,9 @@ type Options struct {
 	EncryptionKey []byte
 	// DataDir is the directory where SSTables will be stored.
 	DataDir string
+	// Compare is the key comparison function used for ordering keys.
+	// If nil, bytes.Compare is used.
+	Compare func(key1, key2 []byte) int
 }
 
 // NewDB creates a new Sepia database instance.
@@ -62,12 +65,16 @@ func NewDB(opts Options) (*DB, error) {
 
 	arena := marena.NewArena(opts.ArenaSize)
 	// The seed for the skip list is based on the current time for probabilistic balancing.
-	memtable, err := mskip.NewSkipList(arena, bytes.Compare, uint64(time.Now().UnixNano()))
+	compare := opts.Compare
+	if compare == nil {
+		compare = bytes.Compare
+	}
+	memtable, err := mskip.NewSkipList(arena, compare, uint64(time.Now().UnixNano()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memtable: %w", err)
 	}
 
-	sstManager, err := newSSTManager(opts.VFS, opts.DataDir, opts.EncryptionKey)
+	sstManager, err := newSSTManager(opts.VFS, opts.DataDir, opts.EncryptionKey, compare)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sst manager: %w", err)
 	}
@@ -141,7 +148,7 @@ func (db *DB) flushMemtable() error {
 		return err
 	}
 
-	w := dsst.NewWriter(f, configs, db.encryptionKey)
+	w := dsst.NewWriter(f, configs, db.encryptionKey, db.opts.Compare)
 
 	iter := db.memtable.Iterator()
 	defer iter.Close()
@@ -176,7 +183,7 @@ func (db *DB) flushMemtable() error {
 	if err != nil {
 		return err
 	}
-	r, _, err := dsst.NewReader(f, stat.Size(), db.encryptionKey)
+	r, _, err := dsst.NewReader(f, stat.Size(), db.encryptionKey, db.opts.Compare)
 	if err != nil {
 		return err
 	}

@@ -20,10 +20,11 @@ type Reader struct {
 	index         []indexEntry
 	configs       SSTableConfigs
 	encryptionKey []byte
+	compare       func(key1, key2 []byte) int
 }
 
 // NewReader initializes a new SST reader.
-func NewReader(r io.ReaderAt, size int64, encryptionKey []byte) (*Reader, SSTableConfigs, error) {
+func NewReader(r io.ReaderAt, size int64, encryptionKey []byte, compare func(key1, key2 []byte) int) (*Reader, SSTableConfigs, error) {
 	footer, err := readFooter(r, size)
 	if err != nil {
 		return nil, SSTableConfigs{}, fmt.Errorf("failed to read footer: %w", err)
@@ -45,6 +46,7 @@ func NewReader(r io.ReaderAt, size int64, encryptionKey []byte) (*Reader, SSTabl
 		index:         index,
 		configs:       configs,
 		encryptionKey: encryptionKey,
+		compare:       compare,
 	}, configs, nil
 }
 
@@ -142,7 +144,7 @@ func (rd *Reader) findDataBlock(key []byte) (blockHandle, bool) {
 	low, high := 0, len(rd.index)-1
 	for low <= high {
 		mid := (low + high) / 2
-		if bytes.Compare(key, rd.index[mid].firstKey) < 0 {
+		if rd.compare(key, rd.index[mid].firstKey) < 0 {
 			high = mid - 1
 		} else {
 			low = mid + 1
@@ -246,7 +248,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 				return nil, false, fmt.Errorf("failed to decode entry at restart point %d: %w", mid, err)
 			}
 
-			cmp := bytes.Compare(key, kv.Key)
+			cmp := rd.compare(key, kv.Key)
 			if cmp < 0 {
 				high = mid - 1
 			} else {
@@ -273,7 +275,7 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 
 		// If the current key is greater than the target key, then the target key is not in this block.
 		// This check is crucial for correctness after binary search.
-		if bytes.Compare(kv.Key, key) > 0 {
+		if rd.compare(kv.Key, key) > 0 {
 			return nil, false, nil
 		}
 
@@ -431,7 +433,7 @@ func (it *Iterator) Seek(key []byte) {
 			return
 		}
 
-		cmp := bytes.Compare(key, kv.Key)
+					cmp := it.rd.compare(key, kv.Key)
 		if cmp <= 0 {
 			startEntryOffset = currentOffset
 			high = mid - 1
@@ -454,7 +456,7 @@ func (it *Iterator) Seek(key []byte) {
 		it.currentKV = &kv
 		it.prevKey = kv.Key
 
-		if bytes.Compare(it.currentKV.Key, key) >= 0 {
+		if it.rd.compare(it.currentKV.Key, key) >= 0 {
 			return // Found the key or the first key greater than it.
 		}
 	}

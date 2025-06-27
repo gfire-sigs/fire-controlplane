@@ -29,21 +29,23 @@ type Writer struct {
 	configs         SSTableConfigs
 	firstKeyInBlock []byte
 	encryptionKey   []byte
+	compare         func(key1, key2 []byte) int
 }
 
 // NewWriter creates a new SST writer.
-func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte) *Writer {
+func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte, compare func(key1, key2 []byte) int) *Writer {
 	return &Writer{
 		w:             bufio.NewWriter(w),
 		dataBlockBuf:  new(bytes.Buffer),
 		configs:       configs,
 		encryptionKey: encryptionKey,
+		compare:       compare,
 	}
 }
 
 // Add appends a key-value pair to the current data block.
 func (wr *Writer) Add(entry KVEntry) error {
-	if wr.prevKey != nil && bytes.Compare(wr.prevKey, entry.Key) >= 0 {
+	if wr.prevKey != nil && wr.compare(wr.prevKey, entry.Key) >= 0 {
 		return fmt.Errorf("keys must be added in ascending order")
 	}
 

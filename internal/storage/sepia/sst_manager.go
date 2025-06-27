@@ -24,10 +24,11 @@ type sstManager struct {
 		file   vfs.File
 	}
 	encryptionKey []byte
+	compare       func(key1, key2 []byte) int
 }
 
 // newSSTManager creates a new sstManager.
-func newSSTManager(fs vfs.VFS, dir string, encryptionKey []byte) (*sstManager, error) {
+func newSSTManager(fs vfs.VFS, dir string, encryptionKey []byte, compare func(key1, key2 []byte) int) (*sstManager, error) {
 	m := &sstManager{
 		vfs: fs,
 		dir: dir,
@@ -36,6 +37,7 @@ func newSSTManager(fs vfs.VFS, dir string, encryptionKey []byte) (*sstManager, e
 			file   vfs.File
 		}),
 		encryptionKey: encryptionKey,
+		compare:       compare,
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -70,7 +72,7 @@ func (m *sstManager) load() error {
 		if err != nil {
 			return fmt.Errorf("failed to stat file %s: %w", filePath, err)
 		}
-		r, _, err := dsst.NewReader(f, stat.Size(), m.encryptionKey)
+		r, _, err := dsst.NewReader(f, stat.Size(), m.encryptionKey, m.compare)
 		if err != nil {
 			return fmt.Errorf("failed to create sst reader for %s: %w", filePath, err)
 		}

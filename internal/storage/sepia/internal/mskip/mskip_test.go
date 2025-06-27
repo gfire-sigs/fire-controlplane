@@ -259,7 +259,7 @@ func BenchmarkSkipList(b *testing.B) {
 		node := skl.seeklt(key, &log)
 		next := skl.getNode(node).nexts[0]
 		nextValue := skl.arena.View(skl.getNode(next).keyPtr)
-		if bytes.Compare(key, nextValue) != 0 {
+		if !bytes.Equal(key, nextValue) {
 			b.Fatalf("expected key %s, got %s", key, nextValue)
 		}
 	}
