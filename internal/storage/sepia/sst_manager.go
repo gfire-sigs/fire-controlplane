@@ -92,13 +92,10 @@ func (m *sstManager) create() (vfs.File, dsst.SSTableConfigs, int, error) {
 	m.nextNum++
 	name := fmt.Sprintf("%06d.sst", num)
 	fullPath := filepath.Join(m.dir, name)
-	fmt.Printf("sstManager.create: creating file %s\n", fullPath)
 	f, err := m.vfs.Create(fullPath)
 	if err != nil {
-		fmt.Printf("sstManager.create: error creating file: %v\n", err)
 		return nil, dsst.SSTableConfigs{}, 0, err
 	}
-	fmt.Printf("sstManager.create: file %s created successfully\n", fullPath)
 	// Default SSTable configs for now
 	configs := dsst.SSTableConfigs{
 		BlockSize:       32 * 1024, // 32KB
