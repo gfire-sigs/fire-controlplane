@@ -482,6 +482,9 @@ func BenchmarkDBPut(b *testing.B) {
 		Compare:   bytes.Compare,
 	}
 
+	numKeys := 10000
+	b.SetBytes(int64(numKeys))
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		db, err := NewDB(opts)
@@ -490,7 +493,6 @@ func BenchmarkDBPut(b *testing.B) {
 		}
 
 		// Insert a large number of unique keys to trigger flushes
-		numKeys := 10000 // Adjust based on desired benchmark duration and memtable size
 		for j := 0; j < numKeys; j++ {
 			key := []byte(fmt.Sprintf("key-%08d-%d", j, i)) // Unique key for each benchmark iteration
 			value := []byte(fmt.Sprintf("value-%08d", j))
@@ -901,6 +903,8 @@ func BenchmarkDBIterator(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.SetBytes(int64(numKeys))
+
 	for i := 0; i < b.N; i++ {
 		iter := db.Iterator()
 		count := 0

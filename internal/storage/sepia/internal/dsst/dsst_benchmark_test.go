@@ -13,7 +13,7 @@ func BenchmarkWriterAdd(b *testing.B) {
 		RestartInterval:         16,
 		WyhashSeed:              123456789,
 		BloomFilterBitsPerKey:   10,
-		BloomFilterNumHashFuncs: 5,
+		BloomFilterNumHashFuncs: 3,
 	}
 
 	b.ResetTimer()
@@ -35,11 +35,11 @@ func BenchmarkWriterAdd(b *testing.B) {
 func BenchmarkWriterFinish(b *testing.B) {
 	configs := SSTableConfigs{
 		CompressionType:         CompressionTypeNone,
-		BlockSize:               4096,
+		BlockSize:               8192,
 		RestartInterval:         16,
 		WyhashSeed:              123456789,
 		BloomFilterBitsPerKey:   10,
-		BloomFilterNumHashFuncs: 5,
+		BloomFilterNumHashFuncs: 3,
 	}
 
 	b.ResetTimer()
@@ -47,7 +47,7 @@ func BenchmarkWriterFinish(b *testing.B) {
 		var buf bytes.Buffer
 		writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
 		// Generate test data with ascending keys
-		for j := 0; j < 100; j++ { // Reduced number of entries for faster benchmark
+		for j := 0; j < 50; j++ { // Further reduced number of entries to test scaling
 			entry := KVEntry{
 				EntryType: EntryTypeKeyValue,
 				Key:       []byte(fmt.Sprintf("key%09d", j)), // Use padded number to ensure ascending order

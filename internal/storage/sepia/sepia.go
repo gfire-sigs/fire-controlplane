@@ -153,6 +153,8 @@ func (db *DB) flushMemtable() error {
 	iter := db.memtable.Iterator()
 	defer iter.Close()
 
+	const batchSize = 100
+	batch := make([]dsst.KVEntry, 0, batchSize)
 	for iter.First(); iter.Valid(); iter.Next() {
 		// The value stored in memtable is the actual value for KeyValue entries,
 		// or nil for Tombstone entries. We need to reconstruct the KVEntry.
@@ -169,7 +171,19 @@ func (db *DB) flushMemtable() error {
 			Value:     value,
 		}
 
-		if err := w.Add(kvEntry); err != nil {
+		batch = append(batch, kvEntry)
+		if len(batch) >= batchSize {
+			for _, entry := range batch {
+				if err := w.Add(entry); err != nil {
+					return err
+				}
+			}
+			batch = batch[:0] // Reset batch
+		}
+	}
+	// Write remaining entries in the batch
+	for _, entry := range batch {
+		if err := w.Add(entry); err != nil {
 			return err
 		}
 	}
