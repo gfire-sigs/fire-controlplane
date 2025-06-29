@@ -1,4 +1,4 @@
-package bloom
+package dbloom
 
 import (
 	"encoding/binary"

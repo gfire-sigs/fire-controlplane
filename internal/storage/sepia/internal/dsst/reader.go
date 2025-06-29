@@ -10,17 +10,19 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 
 // Reader allows searching for keys within an SST file.
 type Reader struct {
-	r             io.ReaderAt
-	footer        SSTFooter
-	index         []indexEntry
-	configs       SSTableConfigs
-	encryptionKey []byte
-	compare       func(key1, key2 []byte) int
+	r                 io.ReaderAt
+	footer            SSTFooter
+	index             []indexEntry
+	configs           SSTableConfigs
+	encryptionKey     []byte
+	compare           func(key1, key2 []byte) int
+	blockBloomFilters []blockBloomFilterEntry // Store bloom filters for each block
 }
 
 // NewReader initializes a new SST reader.
@@ -40,13 +42,22 @@ func NewReader(r io.ReaderAt, size int64, encryptionKey []byte, compare func(key
 		return nil, SSTableConfigs{}, fmt.Errorf("failed to read index block: %w", err)
 	}
 
+	var blockBloomFilters []blockBloomFilterEntry
+	if footer.BloomFilterHandle.size > 0 {
+		blockBloomFilters, err = readBloomFilterBlock(r, footer.BloomFilterHandle, configs.WyhashSeed)
+		if err != nil {
+			return nil, SSTableConfigs{}, fmt.Errorf("failed to read bloom filter block: %w", err)
+		}
+	}
+
 	return &Reader{
-		r:             r,
-		footer:        footer,
-		index:         index,
-		configs:       configs,
-		encryptionKey: encryptionKey,
-		compare:       compare,
+		r:                 r,
+		footer:            footer,
+		index:             index,
+		configs:           configs,
+		encryptionKey:     encryptionKey,
+		compare:           compare,
+		blockBloomFilters: blockBloomFilters,
 	}, configs, nil
 }
 
@@ -56,6 +67,16 @@ func (rd *Reader) Get(key []byte) ([]byte, bool, error) {
 	blockHandle, found := rd.findDataBlock(key)
 	if !found {
 		return nil, false, nil
+	}
+
+	// Check bloom filter for the specific block
+	for _, entry := range rd.blockBloomFilters {
+		if entry.blockHandle.offset == blockHandle.offset && entry.blockHandle.size == blockHandle.size {
+			if !entry.bloomFilter.Get(key) {
+				return nil, false, nil // Key definitely not in this block
+			}
+			break
+		}
 	}
 
 	// Read the data block and search for the key within it
@@ -74,9 +95,11 @@ func readFooter(r io.ReaderAt, size int64) (SSTFooter, error) {
 	footer.MetaindexHandle.size = binary.LittleEndian.Uint64(buf[8:16])
 	footer.IndexHandle.offset = binary.LittleEndian.Uint64(buf[16:24])
 	footer.IndexHandle.size = binary.LittleEndian.Uint64(buf[24:32])
-	footer.WyhashSeed = binary.LittleEndian.Uint64(buf[32:40])
-	copy(footer.Magic[:], buf[40:56])
-	footer.Version = binary.LittleEndian.Uint64(buf[56:64])
+	footer.BloomFilterHandle.offset = binary.LittleEndian.Uint64(buf[32:40]) // New: BloomFilterHandle offset
+	footer.BloomFilterHandle.size = binary.LittleEndian.Uint64(buf[40:48])   // New: BloomFilterHandle size
+	footer.WyhashSeed = binary.LittleEndian.Uint64(buf[48:56])
+	copy(footer.Magic[:], buf[56:72])                       // Adjusted offset
+	footer.Version = binary.LittleEndian.Uint64(buf[72:80]) // Adjusted offset
 
 	if string(footer.Magic[:]) != SST_V1_MAGIC {
 		return SSTFooter{}, fmt.Errorf("invalid SST magic: got %s", string(footer.Magic[:]))
@@ -100,15 +123,35 @@ func readMetaindexBlock(r io.ReaderAt, handle blockHandle) (SSTableConfigs, erro
 	}
 	configs.CompressionType = CompressionType(compressionTypeByte)
 
-	if err := binary.Read(reader, binary.LittleEndian, &configs.BlockSize); err != nil {
+	// Read BlockSize (uint32)
+	if _, err := io.ReadFull(reader, buf[0:4]); err != nil {
 		return SSTableConfigs{}, fmt.Errorf("failed to read block size: %w", err)
 	}
-	if err := binary.Read(reader, binary.LittleEndian, &configs.RestartInterval); err != nil {
+	configs.BlockSize = binary.LittleEndian.Uint32(buf[0:4])
+
+	// Read RestartInterval (uint32)
+	if _, err := io.ReadFull(reader, buf[0:4]); err != nil {
 		return SSTableConfigs{}, fmt.Errorf("failed to read restart interval: %w", err)
 	}
-	if err := binary.Read(reader, binary.LittleEndian, &configs.WyhashSeed); err != nil {
+	configs.RestartInterval = binary.LittleEndian.Uint32(buf[0:4])
+
+	// Read WyhashSeed (uint64)
+	if _, err := io.ReadFull(reader, buf[0:8]); err != nil {
 		return SSTableConfigs{}, fmt.Errorf("failed to read wyhash seed: %w", err)
 	}
+	configs.WyhashSeed = binary.LittleEndian.Uint64(buf[0:8])
+
+	// Read BloomFilterBitsPerKey (int)
+	if _, err := io.ReadFull(reader, buf[0:4]); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read bloom filter bits per key: %w", err)
+	}
+	configs.BloomFilterBitsPerKey = int(binary.LittleEndian.Uint32(buf[0:4]))
+
+	// Read BloomFilterNumHashFuncs (int)
+	if _, err := io.ReadFull(reader, buf[0:4]); err != nil {
+		return SSTableConfigs{}, fmt.Errorf("failed to read bloom filter num hash funcs: %w", err)
+	}
+	configs.BloomFilterNumHashFuncs = int(binary.LittleEndian.Uint32(buf[0:4]))
 
 	return configs, nil
 }
@@ -134,6 +177,67 @@ func readIndexBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) ([]ind
 			return nil, err
 		}
 		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+func readBloomFilterBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) ([]blockBloomFilterEntry, error) {
+	buf := make([]byte, handle.size)
+	_, err := r.ReadAt(buf, int64(handle.offset))
+	if err != nil {
+		return nil, err
+	}
+
+	checksum := wyhash.Hash(buf[:len(buf)-8], wyhashSeed)
+	expectedChecksum := binary.LittleEndian.Uint64(buf[len(buf)-8:])
+	if checksum != expectedChecksum {
+		return nil, fmt.Errorf("bloom filter block checksum mismatch")
+	}
+
+	var entries []blockBloomFilterEntry
+	reader := bytes.NewReader(buf[:len(buf)-8])
+	for reader.Len() > 0 {
+		keyLen, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read key length: %w", err)
+		}
+
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(reader, key); err != nil {
+			return nil, fmt.Errorf("failed to read key: %w", err)
+		}
+
+		bloomDataLen, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read bloom data length: %w", err)
+		}
+
+		bloomData := make([]byte, bloomDataLen)
+		if _, err := io.ReadFull(reader, bloomData); err != nil {
+			return nil, fmt.Errorf("failed to read bloom data: %w", err)
+		}
+
+		bf, err := dbloom.FromBytes(bloomData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bloom filter from bytes: %w", err)
+		}
+
+		offset, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read block handle offset: %w", err)
+		}
+
+		size, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read block handle size: %w", err)
+		}
+
+		entries = append(entries, blockBloomFilterEntry{
+			firstKey:    key,
+			bloomFilter: bf,
+			blockHandle: blockHandle{offset: offset, size: size},
+		})
 	}
 
 	return entries, nil
@@ -433,7 +537,7 @@ func (it *Iterator) Seek(key []byte) {
 			return
 		}
 
-					cmp := it.rd.compare(key, kv.Key)
+		cmp := it.rd.compare(key, kv.Key)
 		if cmp <= 0 {
 			startEntryOffset = currentOffset
 			high = mid - 1

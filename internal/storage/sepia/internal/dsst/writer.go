@@ -12,6 +12,7 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom" // Add dbloom import
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 
@@ -19,27 +20,31 @@ const DefaultEncryptionKeyStr = "00112233445566778899AABBCCDDEEFF"
 
 // Writer facilitates the creation of an SST file in a streaming manner.
 type Writer struct {
-	w               *bufio.Writer
-	offset          uint64
-	indexEntries    []indexEntry
-	dataBlockBuf    *bytes.Buffer
-	restartPoints   []uint32
-	prevKey         []byte
-	entryCounter    int
-	configs         SSTableConfigs
-	firstKeyInBlock []byte
-	encryptionKey   []byte
-	compare         func(key1, key2 []byte) int
+	w                 *bufio.Writer
+	offset            uint64
+	indexEntries      []indexEntry
+	dataBlockBuf      *bytes.Buffer
+	restartPoints     []uint32
+	prevKey           []byte
+	entryCounter      int
+	configs           SSTableConfigs
+	firstKeyInBlock   []byte
+	encryptionKey     []byte
+	compare           func(key1, key2 []byte) int
+	blockBloomFilter  *dbloom.Bloom           // Bloom filter for the current block
+	blockKeysAdded    int                     // Count of keys added to the current block for bloom filter sizing
+	blockBloomFilters []blockBloomFilterEntry // Store bloom filters for each block
 }
 
 // NewWriter creates a new SST writer.
 func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte, compare func(key1, key2 []byte) int) *Writer {
 	return &Writer{
-		w:             bufio.NewWriter(w),
-		dataBlockBuf:  new(bytes.Buffer),
-		configs:       configs,
-		encryptionKey: encryptionKey,
-		compare:       compare,
+		w:                bufio.NewWriter(w),
+		dataBlockBuf:     new(bytes.Buffer),
+		configs:          configs,
+		encryptionKey:    encryptionKey,
+		compare:          compare,
+		blockBloomFilter: dbloom.NewBloom(0, 0), // Initialize with dummy values, will be resized later
 	}
 }
 
@@ -67,6 +72,12 @@ func (wr *Writer) Add(entry KVEntry) error {
 	encodeEntry(wr.dataBlockBuf, encodePrevKey, entry)
 	wr.prevKey = append(wr.prevKey[:0], entry.Key...)
 	wr.entryCounter++
+	wr.blockKeysAdded++ // Increment key counter for current block bloom filter
+
+	// Add key to block bloom filter
+	if wr.configs.BloomFilterBitsPerKey > 0 && wr.configs.BloomFilterNumHashFuncs > 0 {
+		wr.blockBloomFilter.Set(entry.Key)
+	}
 
 	if wr.dataBlockBuf.Len() >= int(wr.configs.BlockSize) {
 		return wr.finishDataBlock()
@@ -94,7 +105,12 @@ func (wr *Writer) Finish() error {
 		return fmt.Errorf("failed to write metaindex block: %w", err)
 	}
 
-	if err := wr.writeFooter(indexHandle, metaindexHandle); err != nil {
+	bloomFilterHandle, err := wr.writeBloomFilterBlock()
+	if err != nil {
+		return fmt.Errorf("failed to write bloom filter block: %w", err)
+	}
+
+	if err := wr.writeFooter(indexHandle, metaindexHandle, bloomFilterHandle); err != nil {
 		return fmt.Errorf("failed to write footer: %w", err)
 	}
 
@@ -115,12 +131,23 @@ func (wr *Writer) finishDataBlock() error {
 	})
 	wr.offset += handle.size
 
+	// Save the current block's bloom filter
+	if wr.configs.BloomFilterBitsPerKey > 0 && wr.configs.BloomFilterNumHashFuncs > 0 && wr.blockKeysAdded > 0 {
+		wr.blockBloomFilters = append(wr.blockBloomFilters, blockBloomFilterEntry{
+			firstKey:    wr.firstKeyInBlock,
+			bloomFilter: wr.blockBloomFilter,
+			blockHandle: handle,
+		})
+	}
+
 	// Reset for the next data block
 	wr.dataBlockBuf.Reset()
 	wr.restartPoints = wr.restartPoints[:0]
 	wr.prevKey = nil
 	wr.entryCounter = 0
 	wr.firstKeyInBlock = nil
+	wr.blockKeysAdded = 0
+	wr.blockBloomFilter = dbloom.NewBloom(uint64(wr.configs.BloomFilterBitsPerKey*int(wr.configs.BlockSize/1024)), uint64(wr.configs.BloomFilterNumHashFuncs))
 
 	return nil
 }
@@ -219,10 +246,24 @@ func (wr *Writer) writeMetaindexBlock() (blockHandle, error) {
 	buf := new(bytes.Buffer)
 
 	// Serialize SSTableConfigs into the metaindex block
-	binary.Write(buf, binary.LittleEndian, byte(wr.configs.CompressionType))
-	binary.Write(buf, binary.LittleEndian, wr.configs.BlockSize)
-	binary.Write(buf, binary.LittleEndian, wr.configs.RestartInterval)
-	binary.Write(buf, binary.LittleEndian, wr.configs.WyhashSeed)
+	buf.WriteByte(byte(wr.configs.CompressionType))
+
+	tmp := make([]byte, 4)
+	binary.LittleEndian.PutUint32(tmp, wr.configs.BlockSize)
+	buf.Write(tmp)
+
+	binary.LittleEndian.PutUint32(tmp, wr.configs.RestartInterval)
+	buf.Write(tmp)
+
+	tmp8 := make([]byte, 8)
+	binary.LittleEndian.PutUint64(tmp8, wr.configs.WyhashSeed)
+	buf.Write(tmp8)
+
+	binary.LittleEndian.PutUint32(tmp, uint32(wr.configs.BloomFilterBitsPerKey))
+	buf.Write(tmp)
+
+	binary.LittleEndian.PutUint32(tmp, uint32(wr.configs.BloomFilterNumHashFuncs))
+	buf.Write(tmp)
 
 	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
 	binary.Write(buf, binary.LittleEndian, checksum)
@@ -237,12 +278,47 @@ func (wr *Writer) writeMetaindexBlock() (blockHandle, error) {
 	return handle, nil
 }
 
-func (wr *Writer) writeFooter(indexHandle, metaindexHandle blockHandle) error {
+func (wr *Writer) writeBloomFilterBlock() (blockHandle, error) {
+	if len(wr.blockBloomFilters) == 0 {
+		return blockHandle{}, nil // No bloom filters to write
+	}
+
+	buf := new(bytes.Buffer)
+	for _, entry := range wr.blockBloomFilters {
+		bloomData := entry.bloomFilter.Bytes()
+		var uvarintBuf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(uvarintBuf[:], uint64(len(entry.firstKey)))
+		buf.Write(uvarintBuf[:n])
+		buf.Write(entry.firstKey)
+		n = binary.PutUvarint(uvarintBuf[:], uint64(len(bloomData)))
+		buf.Write(uvarintBuf[:n])
+		buf.Write(bloomData)
+		n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.offset)
+		buf.Write(uvarintBuf[:n])
+		n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.size)
+		buf.Write(uvarintBuf[:n])
+	}
+
+	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
+	binary.Write(buf, binary.LittleEndian, checksum)
+
+	written, err := wr.w.Write(buf.Bytes())
+	if err != nil {
+		return blockHandle{}, err
+	}
+
+	handle := blockHandle{offset: wr.offset, size: uint64(written)}
+	wr.offset += handle.size
+	return handle, nil
+}
+
+func (wr *Writer) writeFooter(indexHandle, metaindexHandle, bloomFilterHandle blockHandle) error {
 	footer := SSTFooter{
-		MetaindexHandle: metaindexHandle,
-		IndexHandle:     indexHandle,
-		WyhashSeed:      wr.configs.WyhashSeed,
-		Version:         1,
+		MetaindexHandle:   metaindexHandle,
+		IndexHandle:       indexHandle,
+		BloomFilterHandle: bloomFilterHandle,
+		WyhashSeed:        wr.configs.WyhashSeed,
+		Version:           1,
 	}
 	copy(footer.Magic[:], SST_V1_MAGIC)
 
@@ -251,9 +327,11 @@ func (wr *Writer) writeFooter(indexHandle, metaindexHandle blockHandle) error {
 	binary.LittleEndian.PutUint64(buf[8:16], footer.MetaindexHandle.size)
 	binary.LittleEndian.PutUint64(buf[16:24], footer.IndexHandle.offset)
 	binary.LittleEndian.PutUint64(buf[24:32], footer.IndexHandle.size)
-	binary.LittleEndian.PutUint64(buf[32:40], footer.WyhashSeed)
-	copy(buf[40:56], footer.Magic[:])
-	binary.LittleEndian.PutUint64(buf[56:64], footer.Version)
+	binary.LittleEndian.PutUint64(buf[32:40], footer.BloomFilterHandle.offset)
+	binary.LittleEndian.PutUint64(buf[40:48], footer.BloomFilterHandle.size)
+	binary.LittleEndian.PutUint64(buf[48:56], footer.WyhashSeed)
+	copy(buf[56:72], footer.Magic[:])
+	binary.LittleEndian.PutUint64(buf[72:80], footer.Version)
 
 	_, err := wr.w.Write(buf)
 	return err

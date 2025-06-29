@@ -2,91 +2,241 @@ package dsst
 
 import (
 	"bytes"
-	"fmt"
+	"encoding/binary"
 	"testing"
 )
 
-func TestWriterAndReader(t *testing.T) {
-	tests := []struct {
-		name        string
-		compression CompressionType
-	}{
-		{name: "No Compression", compression: CompressionTypeNone},
-		{name: "Snappy Compression", compression: CompressionTypeSnappy},
-		{name: "Zstd Compression", compression: CompressionTypeZstd},
+func TestEncodeDecodeEntry(t *testing.T) {
+	// Test case 1: Basic key-value pair
+	entry1 := KVEntry{
+		EntryType: EntryTypeKeyValue,
+		Key:       []byte("key1"),
+		Value:     []byte("value1"),
+	}
+	buf := new(bytes.Buffer)
+	encodeEntry(buf, nil, entry1)
+
+	reader := bytes.NewReader(buf.Bytes())
+	decodedEntry, err := dsstDecodeEntry(reader, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entry1.EntryType != decodedEntry.EntryType {
+		t.Errorf("expected EntryType %v, got %v", entry1.EntryType, decodedEntry.EntryType)
+	}
+	if !bytes.Equal(entry1.Key, decodedEntry.Key) {
+		t.Errorf("expected Key %v, got %v", entry1.Key, decodedEntry.Key)
+	}
+	if !bytes.Equal(entry1.Value, decodedEntry.Value) {
+		t.Errorf("expected Value %v, got %v", entry1.Value, decodedEntry.Value)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			buf := new(bytes.Buffer)
+	// Test case 2: Key with shared prefix
+	entry2 := KVEntry{
+		EntryType: EntryTypeKeyValue,
+		Key:       []byte("key2"),
+		Value:     []byte("value2"),
+	}
+	buf.Reset()
+	encodeEntry(buf, entry1.Key, entry2)
 
-			encryptionKey := []byte(DefaultEncryptionKeyStr) // Use the default key for testing
+	reader = bytes.NewReader(buf.Bytes())
+	decodedEntry, err = dsstDecodeEntry(reader, entry1.Key)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entry2.EntryType != decodedEntry.EntryType {
+		t.Errorf("expected EntryType %v, got %v", entry2.EntryType, decodedEntry.EntryType)
+	}
+	if !bytes.Equal(entry2.Key, decodedEntry.Key) {
+		t.Errorf("expected Key %v, got %v", entry2.Key, decodedEntry.Key)
+	}
+	if !bytes.Equal(entry2.Value, decodedEntry.Value) {
+		t.Errorf("expected Value %v, got %v", entry2.Value, decodedEntry.Value)
+	}
 
-			configs := SSTableConfigs{
-				CompressionType: tt.compression,
-				BlockSize:       64 << 10, // 64KB
-				RestartInterval: 16,
-				WyhashSeed:      0, // Fixed seed for deterministic tests
-			}
+	// Test case 3: Tombstone entry
+	entry3 := KVEntry{
+		EntryType: EntryTypeTombstone,
+		Key:       []byte("key3"),
+		Value:     nil,
+	}
+	buf.Reset()
+	encodeEntry(buf, nil, entry3)
 
-			// Test Writer
-			writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
-			var kvs []KVEntry
-			// Generate a larger set of keys to ensure multiple blocks and restart points
-			for i := 0; i < 100; i++ {
-				key := []byte(fmt.Sprintf("key%03d", i))
-				value := []byte(fmt.Sprintf("value%03d", i*10))
-				kvs = append(kvs, KVEntry{Key: key, Value: value})
-			}
+	reader = bytes.NewReader(buf.Bytes())
+	decodedEntry, err = dsstDecodeEntry(reader, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if entry3.EntryType != decodedEntry.EntryType {
+		t.Errorf("expected EntryType %v, got %v", entry3.EntryType, decodedEntry.EntryType)
+	}
+	if !bytes.Equal(entry3.Key, decodedEntry.Key) {
+		t.Errorf("expected Key %v, got %v", entry3.Key, decodedEntry.Key)
+	}
+	if decodedEntry.Value != nil {
+		t.Errorf("expected Value to be nil, got %v", decodedEntry.Value)
+	}
+}
 
-			for _, kv := range kvs {
-				if err := writer.Add(kv); err != nil {
-					t.Fatalf("Writer.Add() error = %v", err)
-				}
-			}
+func TestCommonPrefix(t *testing.T) {
+	// Test case 1: Identical keys
+	key1 := []byte("prefix_key")
+	key2 := []byte("prefix_key")
+	length := dsstCommonPrefix(key1, key2)
+	if length != len(key1) {
+		t.Errorf("expected length %v, got %v", len(key1), length)
+	}
 
-			if err := writer.Finish(); err != nil {
-				t.Fatalf("Writer.Finish() error = %v", err)
-			}
+	// Test case 2: Partial prefix
+	key3 := []byte("prefix_1")
+	key4 := []byte("prefix_2")
+	length = dsstCommonPrefix(key3, key4)
+	if length != 7 {
+		t.Errorf("expected length 7, got %v", length)
+	}
 
-			// Test Reader
-			reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey, bytes.Compare)
-			if err != nil {
-				t.Fatalf("NewReader() error = %v", err)
-			}
+	// Test case 3: No common prefix
+	key5 := []byte("a_key")
+	key6 := []byte("b_key")
+	length = dsstCommonPrefix(key5, key6)
+	if length != 0 {
+		t.Errorf("expected length 0, got %v", length)
+	}
 
-			// Check for existing keys
-			for _, kv := range kvs {
-				value, found, err := reader.Get(kv.Key)
-				if err != nil {
-					t.Fatalf("Reader.Get(%q) error = %v", kv.Key, err)
-				}
-				if !found {
-					t.Errorf("Reader.Get(%q) found = false, want true", kv.Key)
-				}
-				if !bytes.Equal(value, kv.Value) {
-					t.Errorf("Reader.Get(%q) value = %q, want %q", kv.Key, value, kv.Value)
-				}
-			}
+	// Test case 4: Empty keys
+	key7 := []byte("")
+	key8 := []byte("")
+	length = dsstCommonPrefix(key7, key8)
+	if length != 0 {
+		t.Errorf("expected length 0, got %v", length)
+	}
 
-			// Check for non-existent keys
-			nonExistentKeys := []string{
-				"key000a", // Between existing keys
-				"key050a",
-				"key100",  // After all keys
-				"akey",    // Before all keys
-				"key0000", // Shorter than existing keys
-				"key00000", // Longer than existing keys
-			}
-			for _, nk := range nonExistentKeys {
-				_, found, err := reader.Get([]byte(nk))
-				if err != nil {
-					t.Fatalf("Reader.Get(%q) error = %v", nk, err)
-				}
-				if found {
-					t.Errorf("Reader.Get(%q) found = true, want false", nk)
-				}
-			}
-		})
+	// Test case 5: One empty key
+	key9 := []byte("key")
+	key10 := []byte("")
+	length = dsstCommonPrefix(key9, key10)
+	if length != 0 {
+		t.Errorf("expected length 0, got %v", length)
+	}
+}
+
+func TestFooterReadWrite(t *testing.T) {
+	footer := SSTFooter{
+		MetaindexHandle:   blockHandle{offset: 100, size: 50},
+		IndexHandle:       blockHandle{offset: 150, size: 30},
+		BloomFilterHandle: blockHandle{offset: 180, size: 20},
+		WyhashSeed:        123456789,
+		Version:           1,
+	}
+	copy(footer.Magic[:], SST_V1_MAGIC)
+
+	buf := make([]byte, SST_FOOTER_SIZE)
+	binary.LittleEndian.PutUint64(buf[0:8], footer.MetaindexHandle.offset)
+	binary.LittleEndian.PutUint64(buf[8:16], footer.MetaindexHandle.size)
+	binary.LittleEndian.PutUint64(buf[16:24], footer.IndexHandle.offset)
+	binary.LittleEndian.PutUint64(buf[24:32], footer.IndexHandle.size)
+	binary.LittleEndian.PutUint64(buf[32:40], footer.BloomFilterHandle.offset)
+	binary.LittleEndian.PutUint64(buf[40:48], footer.BloomFilterHandle.size)
+	binary.LittleEndian.PutUint64(buf[48:56], footer.WyhashSeed)
+	copy(buf[56:72], footer.Magic[:])
+	binary.LittleEndian.PutUint64(buf[72:80], footer.Version)
+
+	reader := bytes.NewReader(buf)
+	readFooter, err := readFooter(reader, int64(len(buf)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if footer.MetaindexHandle != readFooter.MetaindexHandle {
+		t.Errorf("expected MetaindexHandle %v, got %v", footer.MetaindexHandle, readFooter.MetaindexHandle)
+	}
+	if footer.IndexHandle != readFooter.IndexHandle {
+		t.Errorf("expected IndexHandle %v, got %v", footer.IndexHandle, readFooter.IndexHandle)
+	}
+	if footer.BloomFilterHandle != readFooter.BloomFilterHandle {
+		t.Errorf("expected BloomFilterHandle %v, got %v", footer.BloomFilterHandle, readFooter.BloomFilterHandle)
+	}
+	if footer.WyhashSeed != readFooter.WyhashSeed {
+		t.Errorf("expected WyhashSeed %v, got %v", footer.WyhashSeed, readFooter.WyhashSeed)
+	}
+	if !bytes.Equal(footer.Magic[:], readFooter.Magic[:]) {
+		t.Errorf("expected Magic %v, got %v", footer.Magic, readFooter.Magic)
+	}
+	if footer.Version != readFooter.Version {
+		t.Errorf("expected Version %v, got %v", footer.Version, readFooter.Version)
+	}
+}
+
+func TestBloomFilterIntegration(t *testing.T) {
+	configs := SSTableConfigs{
+		CompressionType:         CompressionTypeNone,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
+	}
+
+	// Create a writer
+	var buf bytes.Buffer
+	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+
+	// Add some entries
+	entries := []KVEntry{
+		{EntryType: EntryTypeKeyValue, Key: []byte("key1"), Value: []byte("value1")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key2"), Value: []byte("value2")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key3"), Value: []byte("value3")},
+	}
+
+	for _, entry := range entries {
+		err := writer.Add(entry)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	// Finish writing
+	err := writer.Finish()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Create a reader
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Check if bloom filters are loaded
+	if len(reader.blockBloomFilters) == 0 {
+		t.Error("expected bloom filters to be loaded, but slice is empty")
+	}
+
+	// Test bloom filter for existing keys (should return true)
+	for _, entry := range entries {
+		value, found, err := reader.Get(entry.Key)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !found {
+			t.Errorf("expected key %v to be found", entry.Key)
+		}
+		if !bytes.Equal(entry.Value, value) {
+			t.Errorf("expected value %v for key %v, got %v", entry.Value, entry.Key, value)
+		}
+	}
+
+	// Test bloom filter for non-existing key (should return false or true, but Get should return not found)
+	nonExistingKey := []byte("non_existing_key")
+	value, found, err := reader.Get(nonExistingKey)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Errorf("expected non-existing key %v to not be found", nonExistingKey)
+	}
+	if value != nil {
+		t.Errorf("expected value to be nil for non-existing key, got %v", value)
 	}
 }

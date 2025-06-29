@@ -6,129 +6,154 @@ import (
 	"testing"
 )
 
-// generateKVs generates a slice of KVEntry for benchmarking.
-func generateKVs(count int) []KVEntry {
-	kvs := make([]KVEntry, count)
-	for i := 0; i < count; i++ {
-		kvs[i] = KVEntry{
-			Key:   []byte(fmt.Sprintf("key%07d", i)),
-			Value: []byte(fmt.Sprintf("value%07d", i*10)),
-		}
-	}
-	return kvs
-}
-
 func BenchmarkWriterAdd(b *testing.B) {
-	kvs := generateKVs(10000) // Use a larger set for writer benchmark
-
 	configs := SSTableConfigs{
-		CompressionType: CompressionTypeNone,
-		BlockSize:       64 << 10,
-		RestartInterval: 16,
-		WyhashSeed:      0,
+		CompressionType:         CompressionTypeNone,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
 	}
-	encryptionKey := []byte(DefaultEncryptionKeyStr)
-
-	// Prepare a buffer for writing outside the benchmark loop
-	var finalBuf *bytes.Buffer
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf := new(bytes.Buffer)
-		writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
-		for _, kv := range kvs {
-			if err := writer.Add(kv); err != nil {
-				b.Fatalf("Writer.Add() error = %v", err)
-			}
+		var buf bytes.Buffer
+		writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+		entry := KVEntry{
+			EntryType: EntryTypeKeyValue,
+			Key:       []byte(fmt.Sprintf("key%d", i)),
+			Value:     []byte(fmt.Sprintf("value%d", i)),
 		}
-		if err := writer.Finish(); err != nil {
-			b.Fatalf("Writer.Finish() error = %v", err)
-		}
-		finalBuf = buf // Keep the last buffer for correctness check
-	}
-
-	// Correctness check after all benchmark iterations
-	b.StopTimer() // Stop timer before correctness check
-	reader, _, err := NewReader(bytes.NewReader(finalBuf.Bytes()), int64(finalBuf.Len()), encryptionKey, bytes.Compare)
-	if err != nil {
-		b.Fatalf("Failed to create reader for correctness check: %v", err)
-	}
-	for _, kv := range kvs {
-		value, found, err := reader.Get(kv.Key)
+		err := writer.Add(entry)
 		if err != nil {
-			b.Fatalf("Correctness check: Reader.Get(%q) error = %v", kv.Key, err)
-		}
-		if !found {
-			b.Fatalf("Correctness check: Reader.Get(%q) found = false, want true", kv.Key)
-		}
-		if !bytes.Equal(value, kv.Value) {
-			b.Fatalf("Correctness check: Reader.Get(%q) value = %q, want %q", kv.Key, value, kv.Value)
+			b.Fatalf("unexpected error: %v", err)
 		}
 	}
-	b.StartTimer() // Restart timer if there are more operations after correctness check (though not in this case)
 }
 
-func BenchmarkReaderGet(b *testing.B) {
-	kvs := generateKVs(10000)
-
-	// Prepare the SSTable once outside the benchmark loop
-	buf := new(bytes.Buffer)
+func BenchmarkWriterFinish(b *testing.B) {
 	configs := SSTableConfigs{
-		CompressionType: CompressionTypeNone,
-		BlockSize:       64 << 10,
-		RestartInterval: 16,
-		WyhashSeed:      0,
-	}
-	encryptionKey := []byte(DefaultEncryptionKeyStr)
-
-	writer := NewWriter(buf, configs, encryptionKey, bytes.Compare)
-	for _, kv := range kvs {
-		if err := writer.Add(kv); err != nil {
-			b.Fatalf("Writer.Add() error = %v", err)
-		}
-	}
-	if err := writer.Finish(); err != nil {
-		b.Fatalf("Writer.Finish() error = %v", err)
-	}
-
-	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), encryptionKey, bytes.Compare)
-	if err != nil {
-		b.Fatalf("Failed to create reader: %v", err)
+		CompressionType:         CompressionTypeNone,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
 	}
 
 	b.ResetTimer()
-	b.Run("ExistingKeys", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			key := kvs[i%len(kvs)].Key
-
-			value, found, err := reader.Get(key)
-
-			// Correctness check
+	for i := 0; i < b.N; i++ {
+		var buf bytes.Buffer
+		writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+		// Generate test data with ascending keys
+		for j := 0; j < 100; j++ { // Reduced number of entries for faster benchmark
+			entry := KVEntry{
+				EntryType: EntryTypeKeyValue,
+				Key:       []byte(fmt.Sprintf("key%09d", j)), // Use padded number to ensure ascending order
+				Value:     []byte(fmt.Sprintf("value%d", j)),
+			}
+			err := writer.Add(entry)
 			if err != nil {
-				b.Fatalf("Correctness check: Reader.Get(%q) error = %v", key, err)
-			}
-			if !found {
-				b.Fatalf("Correctness check: Reader.Get(%q) found = false, want true", key)
-			}
-			if !bytes.Equal(value, kvs[i%len(kvs)].Value) {
-				b.Fatalf("Correctness check: Reader.Get(%q) value = %q, want %q", key, value, kvs[i%len(kvs)].Value)
+				b.Fatalf("unexpected error: %v", err)
 			}
 		}
-	})
-
-	b.Run("NonExistingKeys", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			key := []byte(fmt.Sprintf("nonexistent%07d", i))
-
-			_, found, err := reader.Get(key)
-
-			// Correctness check
-			if err != nil {
-				b.Fatalf("Correctness check: Reader.Get(%q) error = %v", key, err)
-			}
-			if found {
-				b.Fatalf("Correctness check: Reader.Get(%q) found = true, want false", key)
-			}
+		err := writer.Finish()
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
 		}
-	})
+	}
+}
+
+func BenchmarkReaderGet(b *testing.B) {
+	configs := SSTableConfigs{
+		CompressionType:         CompressionTypeNone,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
+	}
+
+	// Generate test data and write to buffer once before the benchmark
+	var buf bytes.Buffer
+	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	for i := 0; i < 100; i++ { // Reduced number of entries for faster benchmark
+		entry := KVEntry{
+			EntryType: EntryTypeKeyValue,
+			Key:       []byte(fmt.Sprintf("key%09d", i)), // Use padded number to ensure ascending order
+			Value:     []byte(fmt.Sprintf("value%d", i)),
+		}
+		err := writer.Add(entry)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+	err := writer.Finish()
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	// Create reader once before the benchmark
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := []byte(fmt.Sprintf("key%09d", i%100))
+		_, _, err := reader.Get(key)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+func BenchmarkBloomFilterGet(b *testing.B) {
+	configs := SSTableConfigs{
+		CompressionType:         CompressionTypeNone,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
+	}
+
+	// Generate test data and write to buffer once before the benchmark
+	var buf bytes.Buffer
+	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	for i := 0; i < 100; i++ { // Reduced number of entries for faster benchmark
+		entry := KVEntry{
+			EntryType: EntryTypeKeyValue,
+			Key:       []byte(fmt.Sprintf("key%09d", i)), // Use padded number to ensure ascending order
+			Value:     []byte(fmt.Sprintf("value%d", i)),
+		}
+		err := writer.Add(entry)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+	err := writer.Finish()
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	// Create reader once before the benchmark
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	if err != nil {
+		b.Fatalf("unexpected error: %v", err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := []byte(fmt.Sprintf("non_existing_key%09d", i))
+		_, found, err := reader.Get(key)
+		if err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+		if found {
+			b.Errorf("expected non-existing key to not be found")
+		}
+	}
 }

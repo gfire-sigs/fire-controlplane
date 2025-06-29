@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom"
 )
 
 //go:generate stringer -type=CompressionType
@@ -29,16 +31,18 @@ const (
 	SST_V1_MAGIC = "SEPIASSTMAGICV01"
 
 	// SST_FOOTER_SIZE is the fixed size of the file footer.
-	// 2*blockHandle(16) + 8-byte wyhash_seed + 16-byte magic + 8-byte version
-	SST_FOOTER_SIZE = 64
+	// 2*blockHandle(16) + 8-byte wyhash_seed + 16-byte magic + 8-byte version + 1*blockHandle(16) for bloom filter
+	SST_FOOTER_SIZE = 80
 )
 
 // SSTableConfigs holds the configuration parameters for an SSTable.
 type SSTableConfigs struct {
-	CompressionType CompressionType
-	BlockSize       uint32 // Target size for data blocks, e.g., 64KB
-	RestartInterval uint32 // Number of keys between restart points within a data block
-	WyhashSeed      uint64 // Seed for wyhash checksums
+	CompressionType         CompressionType
+	BlockSize               uint32 // Target size for data blocks, e.g., 64KB
+	RestartInterval         uint32 // Number of keys between restart points within a data block
+	WyhashSeed              uint64 // Seed for wyhash checksums
+	BloomFilterBitsPerKey   int    // Bits per key for the bloom filter
+	BloomFilterNumHashFuncs int    // Number of hash functions for the bloom filter
 }
 
 // BlockHeader contains metadata for each data block.
@@ -63,16 +67,24 @@ type blockHandle struct {
 
 // SSTFooter is the footer written at the end of the SST file.
 type SSTFooter struct {
-	MetaindexHandle blockHandle
-	IndexHandle     blockHandle
-	WyhashSeed      uint64
-	Magic           [16]byte
-	Version         uint64
+	MetaindexHandle   blockHandle
+	IndexHandle       blockHandle
+	BloomFilterHandle blockHandle // Handle for the bloom filter block
+	WyhashSeed        uint64
+	Magic             [16]byte
+	Version           uint64
 }
 
 // indexEntry represents an entry in the index block.
 type indexEntry struct {
 	firstKey    []byte
+	blockHandle blockHandle
+}
+
+// blockBloomFilterEntry represents an entry in the bloom filter block.
+type blockBloomFilterEntry struct {
+	firstKey    []byte
+	bloomFilter *dbloom.Bloom
 	blockHandle blockHandle
 }
 
