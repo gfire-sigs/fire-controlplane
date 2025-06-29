@@ -12,7 +12,7 @@ import (
 
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
-	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom" // Add dbloom import
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/wyhash"
 )
 

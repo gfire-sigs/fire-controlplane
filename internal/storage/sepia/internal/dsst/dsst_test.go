@@ -240,3 +240,139 @@ func TestBloomFilterIntegration(t *testing.T) {
 		t.Errorf("expected value to be nil for non-existing key, got %v", value)
 	}
 }
+
+func TestCompressionIntegrationZstd(t *testing.T) {
+	configs := SSTableConfigs{
+		CompressionType:         CompressionTypeZstd,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
+	}
+
+	// Create a writer
+	var buf bytes.Buffer
+	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+
+	// Add some entries
+	entries := []KVEntry{
+		{EntryType: EntryTypeKeyValue, Key: []byte("key1"), Value: []byte("value1")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key2"), Value: []byte("value2")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key3"), Value: []byte("value3")},
+	}
+
+	for _, entry := range entries {
+		err := writer.Add(entry)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	// Finish writing
+	err := writer.Finish()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Create a reader
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Test reading compressed data for existing keys (should return true)
+	for _, entry := range entries {
+		value, found, err := reader.Get(entry.Key)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !found {
+			t.Errorf("expected key %v to be found", entry.Key)
+		}
+		if !bytes.Equal(entry.Value, value) {
+			t.Errorf("expected value %v for key %v, got %v", entry.Value, entry.Key, value)
+		}
+	}
+
+	// Test reading for non-existing key (should return not found)
+	nonExistingKey := []byte("non_existing_key")
+	value, found, err := reader.Get(nonExistingKey)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Errorf("expected non-existing key %v to not be found", nonExistingKey)
+	}
+	if value != nil {
+		t.Errorf("expected value to be nil for non-existing key, got %v", value)
+	}
+}
+
+func TestCompressionIntegrationSnappy(t *testing.T) {
+	configs := SSTableConfigs{
+		CompressionType:         CompressionTypeSnappy,
+		BlockSize:               4096,
+		RestartInterval:         16,
+		WyhashSeed:              123456789,
+		BloomFilterBitsPerKey:   10,
+		BloomFilterNumHashFuncs: 5,
+	}
+
+	// Create a writer
+	var buf bytes.Buffer
+	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
+
+	// Add some entries
+	entries := []KVEntry{
+		{EntryType: EntryTypeKeyValue, Key: []byte("key1"), Value: []byte("value1")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key2"), Value: []byte("value2")},
+		{EntryType: EntryTypeKeyValue, Key: []byte("key3"), Value: []byte("value3")},
+	}
+
+	for _, entry := range entries {
+		err := writer.Add(entry)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	// Finish writing
+	err := writer.Finish()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Create a reader
+	reader, _, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()), []byte(DefaultEncryptionKeyStr), bytes.Compare)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Test reading compressed data for existing keys (should return true)
+	for _, entry := range entries {
+		value, found, err := reader.Get(entry.Key)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !found {
+			t.Errorf("expected key %v to be found", entry.Key)
+		}
+		if !bytes.Equal(entry.Value, value) {
+			t.Errorf("expected value %v for key %v, got %v", entry.Value, entry.Key, value)
+		}
+	}
+
+	// Test reading for non-existing key (should return not found)
+	nonExistingKey := []byte("non_existing_key")
+	value, found, err := reader.Get(nonExistingKey)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if found {
+		t.Errorf("expected non-existing key %v to not be found", nonExistingKey)
+	}
+	if value != nil {
+		t.Errorf("expected value to be nil for non-existing key, got %v", value)
+	}
+}
