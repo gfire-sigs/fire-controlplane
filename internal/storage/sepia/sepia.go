@@ -3,7 +3,6 @@ package sepia
 import (
 	"bytes"
 	"fmt"
-	"sync"
 	"time"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dsst"
@@ -21,7 +20,6 @@ const (
 // DB represents the Sepia key-value database.
 // It holds the current active memtable and manages memory using an arena allocator.
 type DB struct {
-	mu            sync.RWMutex
 	memtable      *mskip.SkipList
 	arena         *marena.Arena
 	sstManager    *sstManager
@@ -96,9 +94,6 @@ func NewDB(opts Options) (*DB, error) {
 var Tombstone = []byte("sepia-tombstone")
 
 func (db *DB) Put(key, value []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	entry := dsst.KVEntry{
 		EntryType: dsst.EntryTypeKeyValue,
 		Key:       key,
@@ -119,9 +114,6 @@ func (db *DB) Put(key, value []byte) error {
 
 // Delete removes a key-value pair from the database by writing a tombstone.
 func (db *DB) Delete(key []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	entry := dsst.KVEntry{
 		EntryType: dsst.EntryTypeTombstone,
 		Key:       key,
@@ -215,9 +207,6 @@ func (db *DB) flushMemtable() error {
 // It returns the value, a boolean indicating if the key was found, and an error.
 // In a full implementation, this would also search SSTables on disk if not in memtable.
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
 	iter := db.memtable.Iterator()
 	defer iter.Close()
 
@@ -257,9 +246,6 @@ func (db *DB) Iterator() iterator.Iterator {
 // Close releases resources used by the database.
 // In a full implementation, this would ensure all data is flushed to disk.
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	if err := db.flushMemtable(); err != nil {
 		return err
 	}
