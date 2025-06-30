@@ -93,44 +93,51 @@ func NewDB(opts Options) (*DB, error) {
 // In a full implementation, this would trigger a flush to disk if the memtable is full.
 var Tombstone = []byte("sepia-tombstone")
 
+// Put inserts a key-value pair into the database.
+// The operation is performed on the in-memory memtable.
 func (db *DB) Put(key, value []byte) error {
-	entry := dsst.KVEntry{
-		EntryType: dsst.EntryTypeKeyValue,
-		Key:       key,
-		Value:     value,
-	}
+	entry := dsst.AcquireKVEntry()
+	entry.EntryType = dsst.EntryTypeKeyValue
+	entry.Key = key
+	entry.Value = value
 
 	if !db.memtable.Insert(entry.Key, entry.Value) {
 		if err := db.flushMemtable(); err != nil {
+			dsst.ReleaseKVEntry(entry)
 			return err
 		}
 		// After flushing, try inserting again into the new memtable
 		if !db.memtable.Insert(entry.Key, entry.Value) {
+			dsst.ReleaseKVEntry(entry)
 			return fmt.Errorf("memtable insertion failed, arena is likely full")
 		}
 	}
+	dsst.ReleaseKVEntry(entry)
 	return nil
 }
 
 // Delete removes a key-value pair from the database by writing a tombstone.
+// Delete removes a key-value pair from the database by writing a tombstone.
 func (db *DB) Delete(key []byte) error {
-	entry := dsst.KVEntry{
-		EntryType: dsst.EntryTypeTombstone,
-		Key:       key,
-		Value:     nil, // Tombstones have no value
-	}
+	entry := dsst.AcquireKVEntry()
+	entry.EntryType = dsst.EntryTypeTombstone
+	entry.Key = key
+	entry.Value = nil // Tombstones have no value
 
 	// Insert a tombstone to mark the key as deleted.
 	// This will be handled during compaction (future work).
 	if !db.memtable.Insert(entry.Key, entry.Value) {
 		if err := db.flushMemtable(); err != nil {
+			dsst.ReleaseKVEntry(entry)
 			return err
 		}
 		// After flushing, try inserting the tombstone again into the new memtable
 		if !db.memtable.Insert(entry.Key, entry.Value) {
+			dsst.ReleaseKVEntry(entry)
 			return fmt.Errorf("memtable insertion of tombstone failed, arena is likely full")
 		}
 	}
+	dsst.ReleaseKVEntry(entry)
 	return nil
 }
 
@@ -145,8 +152,6 @@ func (db *DB) flushMemtable() error {
 	iter := db.memtable.Iterator()
 	defer iter.Close()
 
-	const batchSize = 100
-	batch := make([]dsst.KVEntry, 0, batchSize)
 	for iter.First(); iter.Valid(); iter.Next() {
 		// The value stored in memtable is the actual value for KeyValue entries,
 		// or nil for Tombstone entries. We need to reconstruct the KVEntry.
@@ -157,27 +162,16 @@ func (db *DB) flushMemtable() error {
 			entryType = dsst.EntryTypeTombstone
 		}
 
-		kvEntry := dsst.KVEntry{
-			EntryType: entryType,
-			Key:       iter.Key(),
-			Value:     value,
-		}
+		entry := dsst.AcquireKVEntry()
+		entry.EntryType = entryType
+		entry.Key = iter.Key()
+		entry.Value = value
 
-		batch = append(batch, kvEntry)
-		if len(batch) >= batchSize {
-			for _, entry := range batch {
-				if err := w.Add(entry); err != nil {
-					return err
-				}
-			}
-			batch = batch[:0] // Reset batch
-		}
-	}
-	// Write remaining entries in the batch
-	for _, entry := range batch {
 		if err := w.Add(entry); err != nil {
+			dsst.ReleaseKVEntry(entry)
 			return err
 		}
+		dsst.ReleaseKVEntry(entry)
 	}
 
 	if err := w.Finish(); err != nil {

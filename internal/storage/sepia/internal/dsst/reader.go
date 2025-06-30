@@ -274,9 +274,8 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 		CompressionType: CompressionType(rawBlock[0]),
 	}
 	copy(blockHeader.InitializationVector[:], rawBlock[1:13])
-	copy(blockHeader.AuthenticationTag[:], rawBlock[13:13+aes.BlockSize])
 
-	// Calculate checksum on the block data (excluding header and checksum itself).
+	// Calculate checksum on the block data (excluding checksum itself).
 	// The checksum is on the *encrypted* data + header.
 	checksum := wyhash.Hash(rawBlock[:len(rawBlock)-8], rd.configs.WyhashSeed)
 	expectedChecksum := binary.LittleEndian.Uint64(rawBlock[len(rawBlock)-8:])
@@ -285,7 +284,8 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	}
 
 	// encryptedData starts after the header and ends before the checksum.
-	encryptedData := rawBlock[29 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV + 16 bytes for AuthTag
+	// Authentication tag is now after the encrypted data as per updated spec.
+	encryptedDataWithTag := rawBlock[13 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV
 
 	// Decrypt the data
 	blockCipher, err := aes.NewCipher(rd.encryptionKey)
@@ -297,9 +297,8 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 		return nil, false, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
-	// The encryptedData does not contain the tag, it's separate in the header.
-	// We need to append the tag to the encryptedData before opening.
-	decryptedData, err := gcm.Open(nil, blockHeader.InitializationVector[:], append(encryptedData, blockHeader.AuthenticationTag[:]...), nil)
+	// Pre-allocate a buffer for decrypted data to avoid unnecessary allocations
+	decryptedData, err := gcm.Open(encryptedDataWithTag[:0], blockHeader.InitializationVector[:], encryptedDataWithTag, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to decrypt block: %w", err)
 	}
@@ -359,6 +358,8 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 				startEntryOffset = currentOffset
 				low = mid + 1
 			}
+			// Return the entry to the pool after use
+			ReleaseKVEntry(&kv)
 		}
 	}
 
@@ -380,16 +381,19 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 		// If the current key is greater than the target key, then the target key is not in this block.
 		// This check is crucial for correctness after binary search.
 		if rd.compare(kv.Key, key) > 0 {
+			ReleaseKVEntry(&kv)
 			return nil, false, nil
 		}
 
 		if bytes.Equal(kv.Key, key) {
 			if kv.EntryType == EntryTypeTombstone {
+				ReleaseKVEntry(&kv)
 				return nil, false, nil // Found a tombstone, key is deleted
 			}
 			return kv.Value, true, nil
 		}
 		prevKey = kv.Key
+		ReleaseKVEntry(&kv)
 	}
 
 	return nil, false, nil
@@ -424,7 +428,7 @@ type Iterator struct {
 	rd           *Reader
 	blockIndex   int // Current block index in rd.index
 	blockIter    *bytes.Reader
-	currentKV    *dsstKVEntry
+	currentKV    *KVEntry
 	prevKey      []byte
 	decodedBlock []byte // Store the decoded block data
 	// restartPoints stores the offsets of restart points within the current block.
@@ -477,6 +481,10 @@ func (it *Iterator) Next() {
 		it.currentKV = nil // Invalidate iterator on error.
 		return
 	}
+	// If there was a previous entry, return it to the pool before overwriting
+	if it.currentKV != nil {
+		ReleaseKVEntry(it.currentKV)
+	}
 	it.currentKV = &kv
 	it.prevKey = kv.Key
 }
@@ -499,7 +507,11 @@ func (it *Iterator) Value() []byte {
 
 // Close releases the iterator's resources.
 func (it *Iterator) Close() {
-	// No explicit resources to close for now
+	// Return the current entry to the pool if it exists
+	if it.currentKV != nil {
+		ReleaseKVEntry(it.currentKV)
+		it.currentKV = nil
+	}
 }
 
 // Seek moves the iterator to the first key that is greater than or equal to the given key.
@@ -557,6 +569,10 @@ func (it *Iterator) Seek(key []byte) {
 			it.currentKV = nil
 			return
 		}
+		// If there was a previous entry, return it to the pool before overwriting
+		if it.currentKV != nil {
+			ReleaseKVEntry(it.currentKV)
+		}
 		it.currentKV = &kv
 		it.prevKey = kv.Key
 
@@ -584,10 +600,12 @@ func (it *Iterator) loadBlock() {
 		CompressionType: CompressionType(rawBlock[0]),
 	}
 	copy(blockHeader.InitializationVector[:], rawBlock[1:13])
-	copy(blockHeader.AuthenticationTag[:], rawBlock[13:13+aes.BlockSize])
 
 	// encryptedData starts after the header and ends before the checksum.
-	encryptedData := rawBlock[29 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV + 16 bytes for AuthTag
+	// Authentication tag is now after the encrypted data as per updated spec.
+	encryptedDataWithTag := rawBlock[13 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV
+	encryptedData := encryptedDataWithTag[:len(encryptedDataWithTag)-aes.BlockSize]
+	authTag := encryptedDataWithTag[len(encryptedDataWithTag)-aes.BlockSize:]
 
 	// Decrypt the data
 	blockCipher, err := aes.NewCipher(it.rd.encryptionKey)
@@ -603,7 +621,9 @@ func (it *Iterator) loadBlock() {
 		return
 	}
 
-	decryptedData, err := gcm.Open(nil, blockHeader.InitializationVector[:], append(encryptedData, blockHeader.AuthenticationTag[:]...), nil)
+	// Pre-allocate a buffer for decrypted data to avoid unnecessary allocations
+	decryptedData := make([]byte, len(encryptedData))
+	decryptedData, err = gcm.Open(decryptedData[:0], blockHeader.InitializationVector[:], append(encryptedData, authTag...), nil)
 	if err != nil {
 		// Handle error
 		it.blockIter = nil
@@ -653,5 +673,3 @@ func (it *Iterator) loadBlock() {
 	it.blockIter = bytes.NewReader(it.decodedBlock[:it.restartPointsStart])
 	it.currentRestartPointIndex = 0
 }
-
-// NewMergeIterator creates a new iterator that merges multiple SSTable iterators.

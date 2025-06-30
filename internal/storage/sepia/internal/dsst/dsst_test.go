@@ -190,7 +190,7 @@ func TestBloomFilterIntegration(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		err := writer.Add(entry)
+		err := writer.Add(&entry)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -263,7 +263,7 @@ func TestCompressionIntegrationZstd(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		err := writer.Add(entry)
+		err := writer.Add(&entry)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -331,7 +331,7 @@ func TestCompressionIntegrationSnappy(t *testing.T) {
 	}
 
 	for _, entry := range entries {
-		err := writer.Add(entry)
+		err := writer.Add(&entry)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

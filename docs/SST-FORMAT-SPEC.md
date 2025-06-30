@@ -88,7 +88,8 @@ Each data block is prefixed with a fixed-size header containing metadata about t
 |---------------------------|-----------------------------------------------------|
 | compression_type          | 1-byte enum indicating the compression algorithm used for the block (e.g., None, Snappy, Zstd). |
 | initialization_vector     | 12-byte unique IV for AES-GCM encryption.           |
-| authentication_tag        | 16-byte GCM tag for authenticated encryption.       |
+
+*Note*: The `authentication_tag` (16-byte GCM tag for authenticated encryption) is placed immediately after the encrypted data, not in the header, to optimize performance by reducing memory operations during data appending.
 
 ### 5.1 Entry Encoding
 
@@ -180,10 +181,9 @@ Each data block or range may have an associated Bloom filter entry (`blockBloomF
 Data blocks are always encrypted using AES-GCM-256. The encryption key is provided to the reader and writer at runtime and is not stored in the SST file.
 
 - **IV Generation**: 12-byte random nonce per block
-- **Authentication**: 16-byte GCM tag per block
+- **Authentication**: 16-byte GCM tag per block, placed immediately after the encrypted data to optimize performance.
 - **Header Fields**
   - `initialization_vector` (12 bytes)
-  - `authentication_tag` (16 bytes)
 
 ---
 

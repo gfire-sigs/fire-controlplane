@@ -49,7 +49,7 @@ func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte, compar
 }
 
 // Add appends a key-value pair to the current data block.
-func (wr *Writer) Add(entry KVEntry) error {
+func (wr *Writer) Add(entry *KVEntry) error {
 	if wr.prevKey != nil && wr.compare(wr.prevKey, entry.Key) >= 0 {
 		return fmt.Errorf("keys must be added in ascending order")
 	}
@@ -69,7 +69,7 @@ func (wr *Writer) Add(entry KVEntry) error {
 		encodePrevKey = wr.prevKey
 	}
 
-	encodeEntry(wr.dataBlockBuf, encodePrevKey, entry)
+	encodeEntry(wr.dataBlockBuf, encodePrevKey, *entry)
 	wr.prevKey = append(wr.prevKey[:0], entry.Key...)
 	wr.entryCounter++
 	wr.blockKeysAdded++ // Increment key counter for current block bloom filter
@@ -190,21 +190,21 @@ func (wr *Writer) writeDataBlock(blockBuf *bytes.Buffer, restartPoints []uint32)
 		return blockHandle{}, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	encryptedData := gcm.Seal(nil, nonce, compressedData, nil)
+	// Pre-allocate a buffer for encrypted data to avoid unnecessary allocations
+	encryptedData := make([]byte, len(compressedData)+gcm.Overhead())
+	encryptedData = gcm.Seal(encryptedData[:0], nonce, compressedData, nil)
 
 	// Create block header
 	blockHeader := BlockHeader{
 		CompressionType: wr.configs.CompressionType,
 	}
 	copy(blockHeader.InitializationVector[:], nonce)
-	copy(blockHeader.AuthenticationTag[:], encryptedData[len(encryptedData)-aes.BlockSize:])
-	encryptedData = encryptedData[:len(encryptedData)-aes.BlockSize]
+	// Authentication tag is kept after the encrypted data as per updated spec
 
 	// Serialize block header
 	headerBuf := new(bytes.Buffer)
 	binary.Write(headerBuf, binary.LittleEndian, byte(blockHeader.CompressionType))
 	headerBuf.Write(blockHeader.InitializationVector[:])
-	headerBuf.Write(blockHeader.AuthenticationTag[:])
 
 	// Prepend the serialized block header to the encrypted data.
 	finalBlock := new(bytes.Buffer)

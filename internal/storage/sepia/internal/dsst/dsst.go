@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"sync"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dbloom"
 )
@@ -50,13 +51,6 @@ type BlockHeader struct {
 	CompressionType      CompressionType
 	InitializationVector [12]byte // 12-byte unique IV for AES-GCM
 	AuthenticationTag    [16]byte // 16-byte GCM tag
-}
-
-// KVEntry represents a single key-value pair.
-type KVEntry struct {
-	EntryType EntryType
-	Key       []byte
-	Value     []byte
 }
 
 // blockHandle stores the location (offset) and size of a block within the SST file.
@@ -122,55 +116,85 @@ func dsstCommonPrefix(a, b []byte) int {
 	return i
 }
 
-// dsstKVEntry represents a key-value pair for internal use.
-type dsstKVEntry struct {
+// KVEntry represents a key-value pair for internal use.
+type KVEntry struct {
 	EntryType EntryType
 	Key       []byte
 	Value     []byte
 }
 
+// kvEntryPool is a sync.Pool for reusing KVEntry instances to reduce memory allocations.
+var kvEntryPool = sync.Pool{
+	New: func() interface{} {
+		return &KVEntry{}
+	},
+}
+
+// AcquireKVEntry retrieves a KVEntry from the pool.
+func AcquireKVEntry() *KVEntry {
+	return kvEntryPool.Get().(*KVEntry)
+}
+
+// ReleaseKVEntry returns a KVEntry to the pool after resetting it to prevent data leakage.
+func ReleaseKVEntry(entry *KVEntry) {
+	entry.EntryType = 0
+	entry.Key = nil
+	entry.Value = nil
+	kvEntryPool.Put(entry)
+}
+
 // dsstDecodeEntry decodes a key-value entry from the given reader.
-func dsstDecodeEntry(r *bytes.Reader, prevKey []byte) (dsstKVEntry, error) {
+func dsstDecodeEntry(r *bytes.Reader, prevKey []byte) (KVEntry, error) {
 	entryTypeByte, err := r.ReadByte()
 	if err != nil {
-		return dsstKVEntry{}, err
+		return KVEntry{}, err
 	}
 	entryType := EntryType(entryTypeByte)
 
 	sharedPrefixLen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return dsstKVEntry{}, err
+		return KVEntry{}, err
 	}
 
 	unsharedKeyLen, err := binary.ReadUvarint(r)
 	if err != nil {
-		return dsstKVEntry{}, err
+		return KVEntry{}, err
 	}
 
 	var valueLen uint64
 	if entryType == EntryTypeKeyValue {
 		valueLen, err = binary.ReadUvarint(r)
 		if err != nil {
-			return dsstKVEntry{}, err
+			return KVEntry{}, err
 		}
 	}
 
-	key := make([]byte, sharedPrefixLen+unsharedKeyLen)
+	// Allocate a byte slice for the key.
+	requiredLen := sharedPrefixLen + unsharedKeyLen
+	key := make([]byte, requiredLen)
 	copy(key, prevKey[:sharedPrefixLen])
 
+	// Allocate a byte slice for the unshared key part.
 	unsharedKey := make([]byte, unsharedKeyLen)
 	if _, err := io.ReadFull(r, unsharedKey); err != nil {
-		return dsstKVEntry{}, err
+		return KVEntry{}, err
 	}
 	copy(key[sharedPrefixLen:], unsharedKey)
 
 	var value []byte
 	if entryType == EntryTypeKeyValue {
+		// Allocate a byte slice for the value.
 		value = make([]byte, valueLen)
 		if _, err := io.ReadFull(r, value); err != nil {
-			return dsstKVEntry{}, err
+			return KVEntry{}, err
 		}
 	}
 
-	return dsstKVEntry{EntryType: entryType, Key: key, Value: value}, nil
+	// Get a pooled entry.
+	entry := AcquireKVEntry()
+	entry.EntryType = entryType
+	entry.Key = key
+	entry.Value = value
+	// Note: The caller is responsible for returning the entry to the pool using ReleaseKVEntry if needed.
+	return *entry, nil
 }

@@ -20,15 +20,21 @@ func BenchmarkWriterAdd(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var buf bytes.Buffer
 		writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
-		entry := KVEntry{
-			EntryType: EntryTypeKeyValue,
-			Key:       []byte(fmt.Sprintf("key%d", i)),
-			Value:     []byte(fmt.Sprintf("value%d", i)),
+		entry := AcquireKVEntry()
+		entry.EntryType = EntryTypeKeyValue
+		entry.Key = []byte(fmt.Sprintf("key%d", i))
+		entry.Value = []byte(fmt.Sprintf("value%d", i))
+		kvEntry := KVEntry{
+			EntryType: entry.EntryType,
+			Key:       entry.Key,
+			Value:     entry.Value,
 		}
-		err := writer.Add(entry)
+		err := writer.Add(&kvEntry)
 		if err != nil {
+			ReleaseKVEntry(entry)
 			b.Fatalf("unexpected error: %v", err)
 		}
+		ReleaseKVEntry(entry)
 	}
 }
 
@@ -48,15 +54,21 @@ func BenchmarkWriterFinish(b *testing.B) {
 		writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
 		// Generate test data with ascending keys
 		for j := 0; j < 50; j++ { // Further reduced number of entries to test scaling
-			entry := KVEntry{
-				EntryType: EntryTypeKeyValue,
-				Key:       []byte(fmt.Sprintf("key%09d", j)), // Use padded number to ensure ascending order
-				Value:     []byte(fmt.Sprintf("value%d", j)),
+			entry := AcquireKVEntry()
+			entry.EntryType = EntryTypeKeyValue
+			entry.Key = []byte(fmt.Sprintf("key%09d", j)) // Use padded number to ensure ascending order
+			entry.Value = []byte(fmt.Sprintf("value%d", j))
+			kvEntry := KVEntry{
+				EntryType: entry.EntryType,
+				Key:       entry.Key,
+				Value:     entry.Value,
 			}
-			err := writer.Add(entry)
+			err := writer.Add(&kvEntry)
 			if err != nil {
+				ReleaseKVEntry(entry)
 				b.Fatalf("unexpected error: %v", err)
 			}
+			ReleaseKVEntry(entry)
 		}
 		err := writer.Finish()
 		if err != nil {
@@ -79,15 +91,21 @@ func BenchmarkReaderGet(b *testing.B) {
 	var buf bytes.Buffer
 	writer := NewWriter(&buf, configs, []byte(DefaultEncryptionKeyStr), bytes.Compare)
 	for i := 0; i < 100; i++ { // Reduced number of entries for faster benchmark
-		entry := KVEntry{
-			EntryType: EntryTypeKeyValue,
-			Key:       []byte(fmt.Sprintf("key%09d", i)), // Use padded number to ensure ascending order
-			Value:     []byte(fmt.Sprintf("value%d", i)),
+		entry := AcquireKVEntry()
+		entry.EntryType = EntryTypeKeyValue
+		entry.Key = []byte(fmt.Sprintf("key%09d", i)) // Use padded number to ensure ascending order
+		entry.Value = []byte(fmt.Sprintf("value%d", i))
+		kvEntry := KVEntry{
+			EntryType: entry.EntryType,
+			Key:       entry.Key,
+			Value:     entry.Value,
 		}
-		err := writer.Add(entry)
+		err := writer.Add(&kvEntry)
 		if err != nil {
+			ReleaseKVEntry(entry)
 			b.Fatalf("unexpected error: %v", err)
 		}
+		ReleaseKVEntry(entry)
 	}
 	err := writer.Finish()
 	if err != nil {
@@ -129,7 +147,7 @@ func BenchmarkBloomFilterGet(b *testing.B) {
 			Key:       []byte(fmt.Sprintf("key%09d", i)), // Use padded number to ensure ascending order
 			Value:     []byte(fmt.Sprintf("value%d", i)),
 		}
-		err := writer.Add(entry)
+		err := writer.Add(&entry)
 		if err != nil {
 			b.Fatalf("unexpected error: %v", err)
 		}
