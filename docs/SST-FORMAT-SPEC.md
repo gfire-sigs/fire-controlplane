@@ -98,9 +98,9 @@ Each entry encodes key-value pairs or tombstones using prefix compression, follo
 | Field               | Description                                         |
 |---------------------|-----------------------------------------------------|
 | entry_type          | 1-byte enum indicating type (KeyValue or Tombstone) |
-| shared_prefix_len   | Length of prefix shared with previous key (varint)  |
-| unshared_key_len    | Length of non-shared key suffix (varint)           |
-| value_len           | Length of value (varint, only for KeyValue entries)|
+| shared_prefix_len   | Length of prefix shared with previous key (8-byte integer)  |
+| unshared_key_len    | Length of non-shared key suffix (8-byte integer)           |
+| value_len           | Length of value (8-byte integer, only for KeyValue entries)|
 | unshared_key_bytes  | Suffix bytes                                       |
 | value_bytes         | Value bytes (only for KeyValue entries)            |
 

@@ -286,17 +286,17 @@ func (wr *Writer) writeBloomFilterBlock() (blockHandle, error) {
 	buf := new(bytes.Buffer)
 	for _, entry := range wr.blockBloomFilters {
 		bloomData := entry.bloomFilter.Bytes()
-		var uvarintBuf [binary.MaxVarintLen64]byte
-		n := binary.PutUvarint(uvarintBuf[:], uint64(len(entry.firstKey)))
-		buf.Write(uvarintBuf[:n])
+		var uint64Buf [8]byte
+		binary.LittleEndian.PutUint64(uint64Buf[:], uint64(len(entry.firstKey)))
+		buf.Write(uint64Buf[:])
 		buf.Write(entry.firstKey)
-		n = binary.PutUvarint(uvarintBuf[:], uint64(len(bloomData)))
-		buf.Write(uvarintBuf[:n])
+		binary.LittleEndian.PutUint64(uint64Buf[:], uint64(len(bloomData)))
+		buf.Write(uint64Buf[:])
 		buf.Write(bloomData)
-		n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.offset)
-		buf.Write(uvarintBuf[:n])
-		n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.size)
-		buf.Write(uvarintBuf[:n])
+		binary.LittleEndian.PutUint64(uint64Buf[:], entry.blockHandle.offset)
+		buf.Write(uint64Buf[:])
+		binary.LittleEndian.PutUint64(uint64Buf[:], entry.blockHandle.size)
+		buf.Write(uint64Buf[:])
 	}
 
 	checksum := wyhash.Hash(buf.Bytes(), wr.configs.WyhashSeed)
@@ -338,13 +338,13 @@ func (wr *Writer) writeFooter(indexHandle, metaindexHandle, bloomFilterHandle bl
 }
 
 func encodeIndexEntry(buf *bytes.Buffer, entry indexEntry) {
-	var uvarintBuf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(uvarintBuf[:], uint64(len(entry.firstKey)))
-	buf.Write(uvarintBuf[:n])
+	var uint64Buf [8]byte
+	binary.LittleEndian.PutUint64(uint64Buf[:], uint64(len(entry.firstKey)))
+	buf.Write(uint64Buf[:])
 	buf.Write(entry.firstKey)
 
-	n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.offset)
-	buf.Write(uvarintBuf[:n])
-	n = binary.PutUvarint(uvarintBuf[:], entry.blockHandle.size)
-	buf.Write(uvarintBuf[:n])
+	binary.LittleEndian.PutUint64(uint64Buf[:], entry.blockHandle.offset)
+	buf.Write(uint64Buf[:])
+	binary.LittleEndian.PutUint64(uint64Buf[:], entry.blockHandle.size)
+	buf.Write(uint64Buf[:])
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/golang/snappy"
 	"github.com/klauspost/compress/zstd"
@@ -23,6 +24,8 @@ type Reader struct {
 	encryptionKey     []byte
 	compare           func(key1, key2 []byte) int
 	blockBloomFilters []blockBloomFilterEntry // Store bloom filters for each block
+	blockCache        map[uint64][]byte       // Cache for decrypted and decompressed blocks
+	cacheMutex        sync.RWMutex            // Mutex for thread-safe cache access
 }
 
 // NewReader initializes a new SST reader.
@@ -58,6 +61,7 @@ func NewReader(r io.ReaderAt, size int64, encryptionKey []byte, compare func(key
 		encryptionKey:     encryptionKey,
 		compare:           compare,
 		blockBloomFilters: blockBloomFilters,
+		blockCache:        make(map[uint64][]byte),
 	}, configs, nil
 }
 
@@ -198,23 +202,29 @@ func readBloomFilterBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) 
 	var entries []blockBloomFilterEntry
 	reader := bytes.NewReader(buf[:len(buf)-8])
 	for reader.Len() > 0 {
-		keyLen, err := binary.ReadUvarint(reader)
-		if err != nil {
+		var uint64Buf [8]byte
+		var n int
+		n, err = io.ReadFull(reader, uint64Buf[:])
+		if err != nil || n != 8 {
 			return nil, fmt.Errorf("failed to read key length: %w", err)
 		}
+		keyLen := binary.LittleEndian.Uint64(uint64Buf[:])
 
 		key := make([]byte, keyLen)
-		if _, err := io.ReadFull(reader, key); err != nil {
+		_, err = io.ReadFull(reader, key)
+		if err != nil {
 			return nil, fmt.Errorf("failed to read key: %w", err)
 		}
 
-		bloomDataLen, err := binary.ReadUvarint(reader)
-		if err != nil {
+		n, err = io.ReadFull(reader, uint64Buf[:])
+		if err != nil || n != 8 {
 			return nil, fmt.Errorf("failed to read bloom data length: %w", err)
 		}
+		bloomDataLen := binary.LittleEndian.Uint64(uint64Buf[:])
 
 		bloomData := make([]byte, bloomDataLen)
-		if _, err := io.ReadFull(reader, bloomData); err != nil {
+		_, err = io.ReadFull(reader, bloomData)
+		if err != nil {
 			return nil, fmt.Errorf("failed to read bloom data: %w", err)
 		}
 
@@ -223,15 +233,17 @@ func readBloomFilterBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) 
 			return nil, fmt.Errorf("failed to create bloom filter from bytes: %w", err)
 		}
 
-		offset, err := binary.ReadUvarint(reader)
-		if err != nil {
+		n, err = io.ReadFull(reader, uint64Buf[:])
+		if err != nil || n != 8 {
 			return nil, fmt.Errorf("failed to read block handle offset: %w", err)
 		}
+		offset := binary.LittleEndian.Uint64(uint64Buf[:])
 
-		size, err := binary.ReadUvarint(reader)
-		if err != nil {
+		n, err = io.ReadFull(reader, uint64Buf[:])
+		if err != nil || n != 8 {
 			return nil, fmt.Errorf("failed to read block handle size: %w", err)
 		}
+		size := binary.LittleEndian.Uint64(uint64Buf[:])
 
 		entries = append(entries, blockBloomFilterEntry{
 			firstKey:    key,
@@ -263,66 +275,85 @@ func (rd *Reader) findDataBlock(key []byte) (blockHandle, bool) {
 }
 
 func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, error) {
-	rawBlock := make([]byte, handle.size)
-	_, err := rd.r.ReadAt(rawBlock, int64(handle.offset))
-	if err != nil {
-		return nil, false, err
-	}
+	// Use the block offset as the cache key
+	cacheKey := handle.offset
 
-	// Read block header
-	blockHeader := BlockHeader{
-		CompressionType: CompressionType(rawBlock[0]),
-	}
-	copy(blockHeader.InitializationVector[:], rawBlock[1:13])
-
-	// Calculate checksum on the block data (excluding checksum itself).
-	// The checksum is on the *encrypted* data + header.
-	checksum := wyhash.Hash(rawBlock[:len(rawBlock)-8], rd.configs.WyhashSeed)
-	expectedChecksum := binary.LittleEndian.Uint64(rawBlock[len(rawBlock)-8:])
-	if checksum != expectedChecksum {
-		return nil, false, fmt.Errorf("data block checksum mismatch")
-	}
-
-	// encryptedData starts after the header and ends before the checksum.
-	// Authentication tag is now after the encrypted data as per updated spec.
-	encryptedDataWithTag := rawBlock[13 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV
-
-	// Decrypt the data
-	blockCipher, err := aes.NewCipher(rd.encryptionKey)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to create AES cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(blockCipher)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	// Pre-allocate a buffer for decrypted data to avoid unnecessary allocations
-	decryptedData, err := gcm.Open(encryptedDataWithTag[:0], blockHeader.InitializationVector[:], encryptedDataWithTag, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to decrypt block: %w", err)
-	}
+	// Check if the block is in cache
+	rd.cacheMutex.RLock()
+	cachedBlock, found := rd.blockCache[cacheKey]
+	rd.cacheMutex.RUnlock()
 
 	var decodedBlock []byte
-	switch blockHeader.CompressionType {
-	case CompressionTypeSnappy:
-		decodedBlock, err = snappy.Decode(nil, decryptedData)
+	var err error
+
+	if found {
+		decodedBlock = cachedBlock
+	} else {
+		rawBlock := make([]byte, handle.size)
+		_, err = rd.r.ReadAt(rawBlock, int64(handle.offset))
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to decompress snappy block: %w", err)
+			return nil, false, err
 		}
-	case CompressionTypeZstd:
-		reader := bytes.NewReader(decryptedData)
-		zstdReader, err := zstd.NewReader(reader)
+
+		// Read block header
+		blockHeader := BlockHeader{
+			CompressionType: CompressionType(rawBlock[0]),
+		}
+		copy(blockHeader.InitializationVector[:], rawBlock[1:13])
+
+		// Calculate checksum on the block data (excluding checksum itself).
+		// The checksum is on the *encrypted* data + header.
+		checksum := wyhash.Hash(rawBlock[:len(rawBlock)-8], rd.configs.WyhashSeed)
+		expectedChecksum := binary.LittleEndian.Uint64(rawBlock[len(rawBlock)-8:])
+		if checksum != expectedChecksum {
+			return nil, false, fmt.Errorf("data block checksum mismatch")
+		}
+
+		// encryptedData starts after the header and ends before the checksum.
+		// Authentication tag is now after the encrypted data as per updated spec.
+		encryptedDataWithTag := rawBlock[13 : len(rawBlock)-8] // 1 byte for CompressionType + 12 bytes for IV
+
+		// Decrypt the data
+		blockCipher, err := aes.NewCipher(rd.encryptionKey)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
+			return nil, false, fmt.Errorf("failed to create AES cipher: %w", err)
 		}
-		defer zstdReader.Close()
-		decodedBlock, err = io.ReadAll(zstdReader)
+		gcm, err := cipher.NewGCM(blockCipher)
 		if err != nil {
-			return nil, false, fmt.Errorf("failed to decompress zstd block: %w", err)
+			return nil, false, fmt.Errorf("failed to create GCM: %w", err)
 		}
-	default:
-		decodedBlock = decryptedData
+
+		// Pre-allocate a buffer for decrypted data to avoid unnecessary allocations
+		decryptedData, err := gcm.Open(encryptedDataWithTag[:0], blockHeader.InitializationVector[:], encryptedDataWithTag, nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to decrypt block: %w", err)
+		}
+
+		switch blockHeader.CompressionType {
+		case CompressionTypeSnappy:
+			decodedBlock, err = snappy.Decode(nil, decryptedData)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to decompress snappy block: %w", err)
+			}
+		case CompressionTypeZstd:
+			reader := bytes.NewReader(decryptedData)
+			zstdReader, err := zstd.NewReader(reader)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to create zstd reader: %w", err)
+			}
+			defer zstdReader.Close()
+			decodedBlock, err = io.ReadAll(zstdReader)
+			if err != nil {
+				return nil, false, fmt.Errorf("failed to decompress zstd block: %w", err)
+			}
+		default:
+			decodedBlock = decryptedData
+		}
+
+		// Store the decoded block in cache
+		rd.cacheMutex.Lock()
+		rd.blockCache[cacheKey] = decodedBlock
+		rd.cacheMutex.Unlock()
 	}
 
 	// Extract restart points and their count from the end of the decoded block
@@ -400,25 +431,31 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 }
 
 func decodeIndexEntry(r *bytes.Reader) (indexEntry, error) {
-	keyLen, err := binary.ReadUvarint(r)
-	if err != nil {
-		return indexEntry{}, err
+	var uint64Buf [8]byte
+	var n int
+	n, err := io.ReadFull(r, uint64Buf[:])
+	if err != nil || n != 8 {
+		return indexEntry{}, fmt.Errorf("failed to read key length: %w", err)
 	}
+	keyLen := binary.LittleEndian.Uint64(uint64Buf[:])
 
 	key := make([]byte, keyLen)
-	if _, err := io.ReadFull(r, key); err != nil {
-		return indexEntry{}, err
+	_, err = io.ReadFull(r, key)
+	if err != nil {
+		return indexEntry{}, fmt.Errorf("failed to read key: %w", err)
 	}
 
-	offset, err := binary.ReadUvarint(r)
-	if err != nil {
-		return indexEntry{}, err
+	n, err = io.ReadFull(r, uint64Buf[:])
+	if err != nil || n != 8 {
+		return indexEntry{}, fmt.Errorf("failed to read offset: %w", err)
 	}
+	offset := binary.LittleEndian.Uint64(uint64Buf[:])
 
-	size, err := binary.ReadUvarint(r)
-	if err != nil {
-		return indexEntry{}, err
+	n, err = io.ReadFull(r, uint64Buf[:])
+	if err != nil || n != 8 {
+		return indexEntry{}, fmt.Errorf("failed to read size: %w", err)
 	}
+	size := binary.LittleEndian.Uint64(uint64Buf[:])
 
 	return indexEntry{firstKey: key, blockHandle: blockHandle{offset: offset, size: size}}, nil
 }

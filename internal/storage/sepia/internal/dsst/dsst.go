@@ -89,16 +89,16 @@ func encodeEntry(buf *bytes.Buffer, prevKey []byte, entry KVEntry) {
 	sharedPrefixLen := dsstCommonPrefix(prevKey, entry.Key)
 	unsharedKey := entry.Key[sharedPrefixLen:]
 
-	var uvarintBuf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(uvarintBuf[:], uint64(sharedPrefixLen))
-	buf.Write(uvarintBuf[:n])
+	var uint64Buf [8]byte
+	binary.LittleEndian.PutUint64(uint64Buf[:], uint64(sharedPrefixLen))
+	buf.Write(uint64Buf[:])
 
-	n = binary.PutUvarint(uvarintBuf[:], uint64(len(unsharedKey)))
-	buf.Write(uvarintBuf[:n])
+	binary.LittleEndian.PutUint64(uint64Buf[:], uint64(len(unsharedKey)))
+	buf.Write(uint64Buf[:])
 
 	if entry.EntryType == EntryTypeKeyValue {
-		n = binary.PutUvarint(uvarintBuf[:], uint64(len(entry.Value)))
-		buf.Write(uvarintBuf[:n])
+		binary.LittleEndian.PutUint64(uint64Buf[:], uint64(len(entry.Value)))
+		buf.Write(uint64Buf[:])
 	}
 
 	buf.Write(unsharedKey)
@@ -151,22 +151,26 @@ func dsstDecodeEntry(r *bytes.Reader, prevKey []byte) (KVEntry, error) {
 	}
 	entryType := EntryType(entryTypeByte)
 
-	sharedPrefixLen, err := binary.ReadUvarint(r)
+	var uint64Buf [8]byte
+	_, err = io.ReadFull(r, uint64Buf[:])
 	if err != nil {
 		return KVEntry{}, err
 	}
+	sharedPrefixLen := binary.LittleEndian.Uint64(uint64Buf[:])
 
-	unsharedKeyLen, err := binary.ReadUvarint(r)
+	_, err = io.ReadFull(r, uint64Buf[:])
 	if err != nil {
 		return KVEntry{}, err
 	}
+	unsharedKeyLen := binary.LittleEndian.Uint64(uint64Buf[:])
 
 	var valueLen uint64
 	if entryType == EntryTypeKeyValue {
-		valueLen, err = binary.ReadUvarint(r)
+		_, err = io.ReadFull(r, uint64Buf[:])
 		if err != nil {
 			return KVEntry{}, err
 		}
+		valueLen = binary.LittleEndian.Uint64(uint64Buf[:])
 	}
 
 	// Allocate a byte slice for the key.
