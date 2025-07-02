@@ -29,8 +29,11 @@ const (
 
 // metadata represents the persistent metadata for the Sepia database.
 type metadata struct {
-	LastWALSequence uint64   `json:"last_wal_sequence"`
-	SSTables        []string `json:"sstables"` // List of SSTable file names
+	LastWALSequence uint64 `json:"last_wal_sequence"`
+	SSTables        []struct {
+		Name  string `json:"name"`  // SSTable file name
+		Level int    `json:"level"` // Level of the SSTable
+	} `json:"sstables"`
 }
 
 // readMetadata reads the metadata from the METADATA file.
@@ -142,7 +145,7 @@ func NewDB(opts Options) (*DB, error) {
 	// The seed for the skip list is based on the current time for probabilistic balancing.
 	compare := opts.Compare
 	if compare == nil {
-		compare = bytes.Compare
+		compare = TimestampCompare
 	}
 	memtable, err := mskip.NewSkipList(arena, compare, uint64(time.Now().UnixNano()))
 	if err != nil {
@@ -174,9 +177,9 @@ func NewDB(opts Options) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read metadata: %w", err)
 	}
-	for _, sstFile := range meta.SSTables {
+	for _, sst := range meta.SSTables {
 		// Reopen SSTables based on metadata
-		sstPath := filepath.Join(db.opts.DataDir, sstFile)
+		sstPath := filepath.Join(db.opts.DataDir, sst.Name)
 		f, err := db.vfs.Open(sstPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open SSTable from metadata %s: %w", sstPath, err)
@@ -192,11 +195,11 @@ func NewDB(opts Options) (*DB, error) {
 			return nil, fmt.Errorf("failed to create SST reader from metadata %s: %w", sstPath, err)
 		}
 		// Extract SST number from filename (e.g., sst-000001.sst -> 1)
-		sstNumStr := strings.TrimPrefix(strings.TrimSuffix(sstFile, ".sst"), "sst-")
+		sstNumStr := strings.TrimPrefix(strings.TrimSuffix(sst.Name, ".sst"), "sst-")
 		sstNum, err := strconv.ParseUint(sstNumStr, 10, 64)
 		if err != nil {
 			f.Close()
-			return nil, fmt.Errorf("failed to parse SST number from filename %s: %w", sstFile, err)
+			return nil, fmt.Errorf("failed to parse SST number from filename %s: %w", sst.Name, err)
 		}
 		db.sstManager.addReader(int(sstNum), r, f)
 	}
@@ -397,15 +400,34 @@ func (db *DB) flushMemtable() error {
 	}
 	db.sstManager.addReader(num, r, f)
 
-	// Update metadata with new SSTable
+	// Update metadata with new SSTable at level 0
 	meta, err := db.readMetadata()
 	if err != nil {
 		return fmt.Errorf("failed to read metadata before updating SSTables: %w", err)
 	}
-	meta.SSTables = append(meta.SSTables, fmt.Sprintf("sst-%06d.sst", num))
+	meta.SSTables = append(meta.SSTables, struct {
+		Name  string `json:"name"`
+		Level int    `json:"level"`
+	}{
+		Name:  fmt.Sprintf("sst-%06d.sst", num),
+		Level: 0,
+	})
 	if err := db.writeMetadata(meta); err != nil {
 		return fmt.Errorf("failed to write metadata after flushing memtable: %w", err)
 	}
+
+	// Trigger compaction for level 0 after adding new SSTable
+	if err := db.sstManager.compact(0); err != nil {
+		return fmt.Errorf("failed to perform compaction after memtable flush: %w", err)
+	}
+
+	// Update metadata after compaction
+	meta, err = db.readMetadata()
+	if err != nil {
+		return fmt.Errorf("failed to read metadata after compaction: %w", err)
+	}
+	// TODO: Update metadata levels based on sstManager levels after compaction
+	// For now, this is a placeholder as the compaction logic in sstManager does not yet update metadata
 
 	db.arena = marena.NewArena(db.opts.ArenaSize)
 	db.memtable, err = mskip.NewSkipList(db.arena, bytes.Compare, uint64(time.Now().UnixNano()))
@@ -453,6 +475,30 @@ func (db *DB) Iterator() iterator.Iterator {
 	sstIter := db.sstManager.Iterator()
 	iters := []iterator.Iterator{memIter, sstIter}
 	return iterator.NewMergeIterator(iters)
+}
+
+// TimestampCompare compares two keys assuming the last 8 bytes of each key represent a 64-bit timestamp.
+// It prioritizes higher timestamps (descending order), and for equal timestamps, it compares the key prefix using bytes.Compare.
+func TimestampCompare(key1, key2 []byte) int {
+	if len(key1) < 8 || len(key2) < 8 {
+		return bytes.Compare(key1, key2) // Fallback if key is too short to have a timestamp
+	}
+
+	// Extract timestamps (last 8 bytes)
+	ts1 := int64(key1[len(key1)-8])<<56 | int64(key1[len(key1)-7])<<48 | int64(key1[len(key1)-6])<<40 | int64(key1[len(key1)-5])<<32 |
+		int64(key1[len(key1)-4])<<24 | int64(key1[len(key1)-3])<<16 | int64(key1[len(key1)-2])<<8 | int64(key1[len(key1)-1])
+	ts2 := int64(key2[len(key2)-8])<<56 | int64(key2[len(key2)-7])<<48 | int64(key2[len(key2)-6])<<40 | int64(key2[len(key2)-5])<<32 |
+		int64(key2[len(key2)-4])<<24 | int64(key2[len(key2)-3])<<16 | int64(key2[len(key2)-2])<<8 | int64(key2[len(key2)-1])
+
+	// Compare timestamps in descending order (higher timestamp first)
+	if ts1 > ts2 {
+		return -1
+	} else if ts1 < ts2 {
+		return 1
+	}
+
+	// If timestamps are equal, compare the key prefix
+	return bytes.Compare(key1[:len(key1)-8], key2[:len(key2)-8])
 }
 
 // Close releases resources used by the database.
