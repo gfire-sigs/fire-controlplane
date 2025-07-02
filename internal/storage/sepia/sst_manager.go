@@ -23,6 +23,7 @@ type sstManager struct {
 		reader *dsst.Reader
 		file   vfs.File
 	}
+	configs       dsst.SSTableConfigs // Default configs for new SSTables
 	encryptionKey []byte
 	compare       func(key1, key2 []byte) int
 }
@@ -36,6 +37,12 @@ func newSSTManager(fs vfs.VFS, dir string, encryptionKey []byte, compare func(ke
 			reader *dsst.Reader
 			file   vfs.File
 		}),
+		configs: dsst.SSTableConfigs{
+			BlockSize:       32 * 1024, // 32KB
+			RestartInterval: 16,
+			BloomFilterBitsPerKey: 10, // Default bloom filter bits per key
+			BloomFilterNumHashFuncs: 6, // Default bloom filter hash functions
+		},
 		encryptionKey: encryptionKey,
 		compare:       compare,
 	}
@@ -56,14 +63,14 @@ func (m *sstManager) load() error {
 			continue
 		}
 		baseName := filepath.Base(name)
-		num, err := strconv.Atoi(strings.TrimSuffix(baseName, ".sst"))
+		num, err := strconv.Atoi(strings.TrimPrefix(strings.TrimSuffix(baseName, ".sst"), "sst-"))
 		if err != nil {
 			return fmt.Errorf("failed to parse sst file number from %s: %w", name, err)
 		}
 		if num >= m.nextNum {
 			m.nextNum = num + 1
 		}
-		filePath := name
+		filePath := filepath.Join(m.dir, name) // Use full path
 		f, err := m.vfs.Open(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", filePath, err)
@@ -90,18 +97,13 @@ func (m *sstManager) create() (vfs.File, dsst.SSTableConfigs, int, error) {
 	defer m.mu.Unlock()
 	num := m.nextNum
 	m.nextNum++
-	name := fmt.Sprintf("%06d.sst", num)
+	name := fmt.Sprintf("sst-%06d.sst", num) // Use sst- prefix for consistency
 	fullPath := filepath.Join(m.dir, name)
 	f, err := m.vfs.Create(fullPath)
 	if err != nil {
 		return nil, dsst.SSTableConfigs{}, 0, err
 	}
-	// Default SSTable configs for now
-	configs := dsst.SSTableConfigs{
-		BlockSize:       32 * 1024, // 32KB
-		RestartInterval: 16,
-	}
-	return f, configs, num, nil
+	return f, m.configs, num, nil
 }
 
 // addReader adds a new dsst.Reader to the manager's files map.

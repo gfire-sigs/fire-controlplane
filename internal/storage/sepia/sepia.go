@@ -2,10 +2,18 @@ package sepia
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dsst"
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dwal"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/marena"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/mskip"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/iterator"
@@ -14,8 +22,65 @@ import (
 
 const (
 	// defaultArenaSize specifies the default memory allocation size for a memtable.
-	defaultArenaSize = 64 * 1024 * 1024 // 64MB
+	defaultArenaSize      = 64 * 1024 * 1024 // 64MB
+	defaultWALSegmentSize = 64 * 1024 * 1024 // 64MB
+	metadataFileName      = "METADATA"
 )
+
+// metadata represents the persistent metadata for the Sepia database.
+type metadata struct {
+	LastWALSequence uint64   `json:"last_wal_sequence"`
+	SSTables        []string `json:"sstables"` // List of SSTable file names
+}
+
+// readMetadata reads the metadata from the METADATA file.
+func (db *DB) readMetadata() (*metadata, error) {
+	metaPath := filepath.Join(db.opts.DataDir, metadataFileName)
+	exists, err := db.vfs.Exists(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check metadata file existence: %w", err)
+	}
+	if !exists {
+		return &metadata{}, nil // Return empty metadata if file doesn't exist
+	}
+
+	file, err := db.vfs.Open(metaPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open metadata file: %w", err)
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata file: %w", err)
+	}
+
+	var meta metadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
+	}
+	return &meta, nil
+}
+
+// writeMetadata writes the metadata to the METADATA file.
+func (db *DB) writeMetadata(meta *metadata) error {
+	metaPath := filepath.Join(db.opts.DataDir, metadataFileName)
+	file, err := db.vfs.Create(metaPath)
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+	defer file.Close()
+
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write metadata to file: %w", err)
+	}
+	return nil
+}
 
 // DB represents the Sepia key-value database.
 // It holds the current active memtable and manages memory using an arena allocator.
@@ -23,6 +88,7 @@ type DB struct {
 	memtable      *mskip.SkipList
 	arena         *marena.Arena
 	sstManager    *sstManager
+	wal           *dwal.WAL // Write-Ahead Log
 	vfs           vfs.VFS
 	opts          Options
 	encryptionKey []byte
@@ -33,6 +99,9 @@ type Options struct {
 	// ArenaSize specifies the size of the memory arena for the memtable.
 	// If zero, defaultArenaSize is used.
 	ArenaSize int64
+	// WALSegmentSize specifies the size of each WAL segment file.
+	// If zero, defaultWALSegmentSize is used.
+	WALSegmentSize int64
 	// VFS is the virtual file system to use.
 	VFS vfs.VFS
 	// EncryptionKey is the key used for SSTable encryption.
@@ -50,6 +119,9 @@ func NewDB(opts Options) (*DB, error) {
 	if opts.ArenaSize == 0 {
 		opts.ArenaSize = defaultArenaSize
 	}
+	if opts.WALSegmentSize == 0 {
+		opts.WALSegmentSize = defaultWALSegmentSize
+	}
 	if opts.VFS == nil {
 		opts.VFS = vfs.NewOSVFS()
 	}
@@ -59,6 +131,11 @@ func NewDB(opts Options) (*DB, error) {
 	// If DataDir is not specified, use a default.
 	if opts.DataDir == "" {
 		opts.DataDir = "./database"
+	}
+
+	// Ensure data directory exists
+	if err := os.MkdirAll(opts.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	arena := marena.NewArena(opts.ArenaSize)
@@ -77,15 +154,113 @@ func NewDB(opts Options) (*DB, error) {
 		return nil, fmt.Errorf("failed to create sst manager: %w", err)
 	}
 
+	wal, err := dwal.NewWAL(opts.VFS, opts.DataDir, opts.WALSegmentSize, opts.EncryptionKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WAL: %w", err)
+	}
+
 	db := &DB{
 		arena:         arena,
 		memtable:      memtable,
 		sstManager:    sstManager,
+		wal:           wal,
 		vfs:           opts.VFS,
 		opts:          opts,
 		encryptionKey: opts.EncryptionKey,
 	}
+
+	// Read metadata and recover SSTables
+	meta, err := db.readMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
+	}
+	for _, sstFile := range meta.SSTables {
+		// Reopen SSTables based on metadata
+		sstPath := filepath.Join(db.opts.DataDir, sstFile)
+		f, err := db.vfs.Open(sstPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open SSTable from metadata %s: %w", sstPath, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("failed to stat SSTable from metadata %s: %w", sstPath, err)
+		}
+		r, _, err := dsst.NewReader(f, info.Size(), db.encryptionKey, db.opts.Compare)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("failed to create SST reader from metadata %s: %w", sstPath, err)
+		}
+		// Extract SST number from filename (e.g., sst-000001.sst -> 1)
+		sstNumStr := strings.TrimPrefix(strings.TrimSuffix(sstFile, ".sst"), "sst-")
+		sstNum, err := strconv.ParseUint(sstNumStr, 10, 64)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("failed to parse SST number from filename %s: %w", sstFile, err)
+		}
+		db.sstManager.addReader(int(sstNum), r, f)
+	}
+
+	// Recover from WAL
+	if err := db.recoverFromWAL(); err != nil {
+		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
+	}
+
 	return db, nil
+}
+
+func (db *DB) recoverFromWAL() error {
+	for {
+		entryData, _, err := db.wal.ReadEntry()
+		if err != nil {
+			if err == io.EOF {
+				break // No more entries
+			}
+			// Handle corrupted or partial entries
+			if errors.Is(err, dwal.ErrPartialEntry) || errors.Is(err, dwal.ErrCorruptedEntry) || errors.Is(err, dwal.ErrChecksumMismatch) {
+				fmt.Printf("Warning: Skipping corrupted or partial WAL entry during recovery: %v\n", err)
+				continue // Skip to next entry
+			}
+			return fmt.Errorf("failed to read WAL entry during recovery: %w", err)
+		}
+
+		entry := dsst.AcquireKVEntry()
+		if err := entry.UnmarshalBinary(entryData); err != nil {
+			dsst.ReleaseKVEntry(entry)
+			return fmt.Errorf("failed to unmarshal WAL entry during recovery: %w", err)
+		}
+
+		// Apply entry to memtable
+		if entry.EntryType == dsst.EntryTypeKeyValue {
+			if !db.memtable.Insert(entry.Key, entry.Value) {
+				// Memtable full during recovery, flush it
+				if err := db.flushMemtable(); err != nil {
+					dsst.ReleaseKVEntry(entry)
+					return fmt.Errorf("failed to flush memtable during WAL recovery: %w", err)
+				}
+				// Try inserting again
+				if !db.memtable.Insert(entry.Key, entry.Value) {
+					dsst.ReleaseKVEntry(entry)
+					return fmt.Errorf("memtable insertion failed during WAL recovery, arena is likely full")
+				}
+			}
+		} else if entry.EntryType == dsst.EntryTypeTombstone {
+			if !db.memtable.Insert(entry.Key, nil) { // Tombstones have nil value in memtable
+				// Memtable full during recovery, flush it
+				if err := db.flushMemtable(); err != nil {
+					dsst.ReleaseKVEntry(entry)
+					return fmt.Errorf("failed to flush memtable during WAL recovery: %w", err)
+				}
+				// Try inserting again
+				if !db.memtable.Insert(entry.Key, nil) {
+					dsst.ReleaseKVEntry(entry)
+					return fmt.Errorf("memtable insertion of tombstone failed during WAL recovery, arena is likely full")
+				}
+			}
+		}
+		dsst.ReleaseKVEntry(entry)
+	}
+	return nil
 }
 
 // Put inserts a key-value pair into the database.
@@ -96,58 +271,85 @@ var Tombstone = []byte("sepia-tombstone")
 // Put inserts a key-value pair into the database.
 // The operation is performed on the in-memory memtable.
 func (db *DB) Put(key, value []byte) error {
-	entry := dsst.AcquireKVEntry()
-	entry.EntryType = dsst.EntryTypeKeyValue
-	entry.Key = key
-	entry.Value = value
+	// First, write to WAL
+	walEntry := dsst.AcquireKVEntry()
+	walEntry.EntryType = dsst.EntryTypeKeyValue
+	walEntry.Key = key
+	walEntry.Value = value
 
-	if !db.memtable.Insert(entry.Key, entry.Value) {
+	walData, err := walEntry.MarshalBinary()
+	if err != nil {
+		dsst.ReleaseKVEntry(walEntry)
+		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+	}
+
+	_, err = db.wal.WriteEntry(walData)
+	if err != nil {
+		dsst.ReleaseKVEntry(walEntry)
+		return fmt.Errorf("failed to write to WAL: %w", err)
+	}
+
+	// Then, insert into memtable
+	if !db.memtable.Insert(key, value) {
 		if err := db.flushMemtable(); err != nil {
-			dsst.ReleaseKVEntry(entry)
+			dsst.ReleaseKVEntry(walEntry)
 			return err
 		}
 		// After flushing, try inserting again into the new memtable
-		if !db.memtable.Insert(entry.Key, entry.Value) {
-			dsst.ReleaseKVEntry(entry)
+		if !db.memtable.Insert(key, value) {
+			dsst.ReleaseKVEntry(walEntry)
 			return fmt.Errorf("memtable insertion failed, arena is likely full")
 		}
 	}
-	dsst.ReleaseKVEntry(entry)
+	dsst.ReleaseKVEntry(walEntry)
 	return nil
 }
 
 // Delete removes a key-value pair from the database by writing a tombstone.
 // Delete removes a key-value pair from the database by writing a tombstone.
 func (db *DB) Delete(key []byte) error {
-	entry := dsst.AcquireKVEntry()
-	entry.EntryType = dsst.EntryTypeTombstone
-	entry.Key = key
-	entry.Value = nil // Tombstones have no value
+	// First, write to WAL
+	walEntry := dsst.AcquireKVEntry()
+	walEntry.EntryType = dsst.EntryTypeTombstone
+	walEntry.Key = key
+	walEntry.Value = nil // Tombstones have no value
 
-	// Insert a tombstone to mark the key as deleted.
+	walData, err := walEntry.MarshalBinary()
+	if err != nil {
+		dsst.ReleaseKVEntry(walEntry)
+		return fmt.Errorf("failed to marshal WAL entry: %w", err)
+	}
+
+	_, err = db.wal.WriteEntry(walData)
+	if err != nil {
+		dsst.ReleaseKVEntry(walEntry)
+		return fmt.Errorf("failed to write to WAL: %w", err)
+	}
+
+	// Then, insert a tombstone to mark the key as deleted.
 	// This will be handled during compaction (future work).
-	if !db.memtable.Insert(entry.Key, entry.Value) {
+	if !db.memtable.Insert(key, nil) {
 		if err := db.flushMemtable(); err != nil {
-			dsst.ReleaseKVEntry(entry)
+			dsst.ReleaseKVEntry(walEntry)
 			return err
 		}
 		// After flushing, try inserting the tombstone again into the new memtable
-		if !db.memtable.Insert(entry.Key, entry.Value) {
-			dsst.ReleaseKVEntry(entry)
+		if !db.memtable.Insert(key, nil) {
+			dsst.ReleaseKVEntry(walEntry)
 			return fmt.Errorf("memtable insertion of tombstone failed, arena is likely full")
 		}
 	}
-	dsst.ReleaseKVEntry(entry)
+	dsst.ReleaseKVEntry(walEntry)
 	return nil
 }
 
 func (db *DB) flushMemtable() error {
-	f, configs, num, err := db.sstManager.create()
+	f, _, num, err := db.sstManager.create()
 	if err != nil {
 		return err
 	}
 
-	w := dsst.NewWriter(f, configs, db.encryptionKey, db.opts.Compare)
+	w := dsst.NewWriter(f, db.sstManager.configs, db.encryptionKey, db.opts.Compare)
 
 	iter := db.memtable.Iterator()
 	defer iter.Close()
@@ -178,16 +380,32 @@ func (db *DB) flushMemtable() error {
 		return err
 	}
 
+	// Ensure the file is synced to disk
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("failed to sync SST file to disk: %w", err)
+	}
+
 	// Add the newly created SST file to the sstManager's files map
 	stat, err := f.Stat()
 	if err != nil {
 		return err
 	}
+	fmt.Printf("Created SST file with number: %d\n", num)
 	r, _, err := dsst.NewReader(f, stat.Size(), db.encryptionKey, db.opts.Compare)
 	if err != nil {
 		return err
 	}
 	db.sstManager.addReader(num, r, f)
+
+	// Update metadata with new SSTable
+	meta, err := db.readMetadata()
+	if err != nil {
+		return fmt.Errorf("failed to read metadata before updating SSTables: %w", err)
+	}
+	meta.SSTables = append(meta.SSTables, fmt.Sprintf("sst-%06d.sst", num))
+	if err := db.writeMetadata(meta); err != nil {
+		return fmt.Errorf("failed to write metadata after flushing memtable: %w", err)
+	}
 
 	db.arena = marena.NewArena(db.opts.ArenaSize)
 	db.memtable, err = mskip.NewSkipList(db.arena, bytes.Compare, uint64(time.Now().UnixNano()))
@@ -242,6 +460,20 @@ func (db *DB) Iterator() iterator.Iterator {
 func (db *DB) Close() error {
 	if err := db.flushMemtable(); err != nil {
 		return err
+	}
+	// Update metadata with last WAL sequence before closing
+	meta, err := db.readMetadata()
+	if err != nil {
+		return fmt.Errorf("failed to read metadata before closing: %w", err)
+	}
+	// TODO: Get actual last committed WAL sequence from WAL
+	meta.LastWALSequence = 0 // Placeholder for now
+	if err := db.writeMetadata(meta); err != nil {
+		return fmt.Errorf("failed to write metadata before closing: %w", err)
+	}
+
+	if err := db.wal.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL: %w", err)
 	}
 	return db.sstManager.close()
 }

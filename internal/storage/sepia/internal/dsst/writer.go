@@ -38,13 +38,16 @@ type Writer struct {
 
 // NewWriter creates a new SST writer.
 func NewWriter(w io.Writer, configs SSTableConfigs, encryptionKey []byte, compare func(key1, key2 []byte) int) *Writer {
+	if compare == nil {
+		compare = bytes.Compare
+	}
 	return &Writer{
 		w:                bufio.NewWriter(w),
 		dataBlockBuf:     new(bytes.Buffer),
 		configs:          configs,
 		encryptionKey:    encryptionKey,
 		compare:          compare,
-		blockBloomFilter: dbloom.NewBloom(0, 0), // Initialize with dummy values, will be resized later
+		blockBloomFilter: dbloom.NewBloom(uint64(configs.BloomFilterBitsPerKey), uint64(configs.BloomFilterNumHashFuncs)),
 	}
 }
 

@@ -3,6 +3,7 @@ package dsst
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"sync"
 
@@ -123,6 +124,67 @@ type KVEntry struct {
 	Value     []byte
 }
 
+// MarshalBinary encodes a KVEntry into a binary format.
+// Format: [EntryType (1 byte)] [KeyLen (4 bytes)] [ValueLen (4 bytes)] [Key] [Value]
+// For Tombstone, ValueLen is 0 and Value is omitted.
+func (e *KVEntry) MarshalBinary() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	buf.WriteByte(byte(e.EntryType))
+
+	keyLenBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(keyLenBytes, uint32(len(e.Key)))
+	buf.Write(keyLenBytes)
+	buf.Write(e.Key)
+
+	if e.EntryType == EntryTypeKeyValue {
+		valueLenBytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(valueLenBytes, uint32(len(e.Value)))
+		buf.Write(valueLenBytes)
+		buf.Write(e.Value)
+	}
+
+	return buf.Bytes(), nil
+}
+
+// UnmarshalBinary decodes a KVEntry from a binary format.
+func (e *KVEntry) UnmarshalBinary(data []byte) error {
+	if len(data) < 1+4 { // EntryType + KeyLen
+		return fmt.Errorf("invalid KVEntry binary data: too short")
+	}
+
+	e.EntryType = EntryType(data[0])
+	offset := 1
+
+	keyLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+	offset += 4
+
+	if len(data) < offset+int(keyLen) {
+		return fmt.Errorf("invalid KVEntry binary data: key data too short")
+	}
+	e.Key = make([]byte, keyLen)
+	copy(e.Key, data[offset:offset+int(keyLen)])
+	offset += int(keyLen)
+
+	if e.EntryType == EntryTypeKeyValue {
+		if len(data) < offset+4 { // ValueLen
+			return fmt.Errorf("invalid KVEntry binary data: value length missing")
+		}
+		valueLen := binary.LittleEndian.Uint32(data[offset : offset+4])
+		offset += 4
+
+		if len(data) < offset+int(valueLen) {
+			return fmt.Errorf("invalid KVEntry binary data: value data too short")
+		}
+		e.Value = make([]byte, valueLen)
+		copy(e.Value, data[offset:offset+int(valueLen)])
+		offset += int(valueLen)
+	} else {
+		e.Value = nil
+	}
+
+	return nil
+}
+
 // kvEntryPool is a sync.Pool for reusing KVEntry instances to reduce memory allocations.
 var kvEntryPool = sync.Pool{
 	New: func() interface{} {
@@ -202,3 +264,4 @@ func dsstDecodeEntry(r *bytes.Reader, prevKey []byte) (KVEntry, error) {
 	// Note: The caller is responsible for returning the entry to the pool using ReleaseKVEntry if needed.
 	return *entry, nil
 }
+

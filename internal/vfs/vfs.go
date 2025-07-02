@@ -23,10 +23,24 @@ type File interface {
 type VFS interface {
 	Create(name string) (File, error)
 	Open(name string) (File, error)
+	OpenFile(name string, flag int, perm os.FileMode) (File, error)
 	Remove(name string) error
 	Rename(oldpath, newpath string) error
 	Exists(name string) (bool, error)
 	List(dir string) ([]string, error)
+}
+
+// osFileWrapper wraps os.File to implement the vfs.File interface.
+type osFileWrapper struct {
+	*os.File
+}
+
+func (f *osFileWrapper) ReadAt(p []byte, off int64) (n int, err error) {
+	return f.File.ReadAt(p, off)
+}
+
+func (f *osFileWrapper) WriteAt(p []byte, off int64) (n int, err error) {
+	return f.File.WriteAt(p, off)
 }
 
 // osVFS is a VFS implementation that uses the OS file system.
@@ -38,11 +52,27 @@ func NewOSVFS() VFS {
 }
 
 func (fs *osVFS) Create(name string) (File, error) {
-	return os.Create(name)
+	f, err := os.Create(name)
+	if err != nil {
+		return nil, err
+	}
+	return &osFileWrapper{f}, nil
 }
 
 func (fs *osVFS) Open(name string) (File, error) {
-	return os.Open(name)
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &osFileWrapper{f}, nil
+}
+
+func (fs *osVFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	f, err := os.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &osFileWrapper{f}, nil
 }
 
 func (fs *osVFS) Remove(name string) error {
@@ -106,6 +136,40 @@ func (fs *memVFS) Open(name string) (File, error) {
 	newFile.data = make([]byte, len(existingFile.data))
 	copy(newFile.data, existingFile.data)
 	newFile.modTime = existingFile.modTime
+	return newFile, nil
+}
+
+func (fs *memVFS) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	_, ok := fs.files[name]
+	if ok && (flag&os.O_EXCL != 0) {
+		return nil, os.ErrExist
+	}
+
+	if !ok && (flag&os.O_CREATE == 0) {
+		return nil, os.ErrNotExist
+	}
+
+	if !ok && (flag&os.O_CREATE != 0) {
+		// Create new file
+		f := newMemFile(name)
+		fs.files[name] = f
+		return f, nil
+	}
+
+	// Open existing file
+	existingFile := fs.files[name]
+	newFile := newMemFile(name)
+	newFile.data = make([]byte, len(existingFile.data))
+	copy(newFile.data, existingFile.data)
+	newFile.modTime = existingFile.modTime
+
+	if flag&os.O_TRUNC != 0 {
+		newFile.data = []byte{}
+	}
+
 	return newFile, nil
 }
 
