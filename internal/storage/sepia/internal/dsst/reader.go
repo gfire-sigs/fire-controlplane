@@ -256,22 +256,37 @@ func readBloomFilterBlock(r io.ReaderAt, handle blockHandle, wyhashSeed uint64) 
 }
 
 func (rd *Reader) findDataBlock(key []byte) (blockHandle, bool) {
-	// Binary search over the index entries
+	if len(rd.index) == 0 {
+		return blockHandle{}, false
+	}
+
+	// Binary search over the index entries.
+	// The index is sorted by firstKey in descending order (due to TimestampCompare).
+	// We want to find the largest firstKey that is less than or equal to the search key.
+	// In a descending sorted list, this means finding the first element that is
+	// less than or equal to the search key.
 	low, high := 0, len(rd.index)-1
+	resultIndex := -1
+
 	for low <= high {
-		mid := (low + high) / 2
-		if rd.compare(key, rd.index[mid].firstKey) < 0 {
-			high = mid - 1
-		} else {
+		mid := low + (high-low)/2
+		cmp := rd.compare(key, rd.index[mid].firstKey)
+
+		if cmp >= 0 { // key is "greater than or equal to" current firstKey (meaning key's timestamp is <= firstKey's timestamp)
+			// This firstKey is a candidate. We want the largest such firstKey,
+			// so we continue searching in the "larger" firstKey direction (lower index).
+			resultIndex = mid
+			high = mid - 1 // Search for a larger firstKey (smaller timestamp)
+		} else { // key is "less than" current firstKey (meaning key's timestamp is > firstKey's timestamp)
+			// This firstKey is too small (timestamp too large). Search in the "smaller" firstKey direction (higher index).
 			low = mid + 1
 		}
 	}
 
-	if high < 0 {
+	if resultIndex == -1 {
 		return blockHandle{}, false
 	}
-
-	return rd.index[high].blockHandle, true
+	return rd.index[resultIndex].blockHandle, true
 }
 
 func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, error) {
@@ -369,6 +384,9 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 	startEntryOffset := uint32(0) // Default to start from the beginning of the block
 	if numRestartPoints > 0 {
 		low, high := 0, int(numRestartPoints)-1
+		// Stores the best candidate offset found so far
+		bestOffset := uint32(0)
+
 		for low <= high {
 			mid := (low + high) / 2
 			currentOffset := restartPoints[mid]
@@ -383,15 +401,16 @@ func (rd *Reader) findInBlock(handle blockHandle, key []byte) ([]byte, bool, err
 			}
 
 			cmp := rd.compare(key, kv.Key)
-			if cmp < 0 {
+			if cmp <= 0 { // key is "less than or equal to" current restart point key (meaning key's timestamp is >= restart point key's timestamp)
+				bestOffset = currentOffset // This could be our starting point, try to find an even larger timestamp (smaller key)
 				high = mid - 1
-			} else {
-				startEntryOffset = currentOffset
-				low = mid + 1
+			} else { // key is "greater than" current restart point key (meaning key's timestamp is < restart point key's timestamp)
+				low = mid + 1 // Search in the upper half (for smaller timestamps)
 			}
 			// Return the entry to the pool after use
 			ReleaseKVEntry(&kv)
 		}
+		startEntryOffset = bestOffset
 	}
 
 	dataReader := bytes.NewReader(decodedBlock[:restartPointsStart])

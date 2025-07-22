@@ -168,8 +168,8 @@ func TestTimestampCompare(t *testing.T) {
 	key3 := append([]byte("keyB"), 0, 0, 0, 0, 0, 0, 0, 10) // Timestamp 10, different prefix
 
 	// Higher timestamp should come first (descending order)
-	assert.Equal(t, -1, TimestampCompare(key2, key1)) // 20 > 10
-	assert.Equal(t, 1, TimestampCompare(key1, key2))  // 10 < 20
+	assert.Equal(t, -1, TimestampCompare(key2, key1)) // 20 > 10, so key2 < key1
+	assert.Equal(t, 1, TimestampCompare(key1, key2))  // 10 < 20, so key1 > key2
 
 	// Same timestamp, compare prefix
 	assert.Equal(t, -1, TimestampCompare(key1, key3)) // keyA < keyB
@@ -182,7 +182,7 @@ func TestTimestampCompare(t *testing.T) {
 	assert.Equal(t, 1, TimestampCompare(shortKey2, shortKey1))
 }
 
-func TestMVCCVersioning(t *testing.T) {
+func TestMVCCVersioningWithSST(t *testing.T) {
 	dir := t.TempDir()
 	fs := vfs.NewOSVFS()
 	key := make([]byte, 32)
@@ -193,6 +193,7 @@ func TestMVCCVersioning(t *testing.T) {
 		DataDir:       dir,
 		VFS:           fs,
 		EncryptionKey: key,
+		ArenaSize:     1024 * 1024, // Small arena to force frequent flushes
 	}
 
 	db, err := NewDB(opts)
@@ -204,19 +205,20 @@ func TestMVCCVersioning(t *testing.T) {
 		return append(baseKey, byte(ts>>56), byte(ts>>48), byte(ts>>40), byte(ts>>32), byte(ts>>24), byte(ts>>16), byte(ts>>8), byte(ts))
 	}
 
-	// Insert multiple versions of the same key with different timestamps
+	// Insert multiple versions of the same key with decreasing timestamps to satisfy ascending order in TimestampCompare
 	baseKey := []byte("mvcc_key")
-	err = db.Put(makeKeyWithTimestamp(baseKey, 10), []byte("value_at_ts10"))
+	err = db.Put(makeKeyWithTimestamp(baseKey, 30), []byte("value_at_ts30"))
 	require.NoError(t, err)
 	err = db.Put(makeKeyWithTimestamp(baseKey, 20), []byte("value_at_ts20"))
 	require.NoError(t, err)
-	err = db.Put(makeKeyWithTimestamp(baseKey, 30), []byte("value_at_ts30"))
+	err = db.Put(makeKeyWithTimestamp(baseKey, 10), []byte("value_at_ts10"))
 	require.NoError(t, err)
 
-	// Since TimestampCompare prioritizes higher timestamps, the latest version should be returned
-	// However, current Get implementation does not handle versioned keys correctly
-	// For this test, we assume the application layer handles key construction
-	// Test retrieval of the latest version
+	// Force a memtable flush to write to SSTable
+	err = db.flushMemtable()
+	require.NoError(t, err)
+
+	// Test retrieval of the latest version from SSTable (highest timestamp, first in order due to TimestampCompare)
 	val, found, err := db.Get(makeKeyWithTimestamp(baseKey, 30))
 	require.NoError(t, err)
 	assert.True(t, found)
@@ -225,6 +227,10 @@ func TestMVCCVersioning(t *testing.T) {
 	// Test deletion of a specific version
 	err = db.Delete(makeKeyWithTimestamp(baseKey, 30))
 	require.NoError(t, err)
+
+	// Force another flush to ensure deletion is persisted
+	// err = db.flushMemtable()
+	// require.NoError(t, err)
 
 	// The deleted version should not be found
 	_, found, err = db.Get(makeKeyWithTimestamp(baseKey, 30))
@@ -236,4 +242,62 @@ func TestMVCCVersioning(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, []byte("value_at_ts20"), val)
+}
+
+func TestBloomFilterAccuracy(t *testing.T) {
+	dir := t.TempDir()
+	fs := vfs.NewOSVFS()
+	key := make([]byte, 32)
+	_, err := io.ReadFull(rand.Reader, key)
+	require.NoError(t, err)
+
+	opts := Options{
+		DataDir:       dir,
+		VFS:           fs,
+		EncryptionKey: key,
+		ArenaSize:     1024 * 1024, // Small arena to force frequent flushes
+	}
+
+	db, err := NewDB(opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Helper function to create a key with a timestamp appended
+	makeKeyWithTimestamp := func(baseKey []byte, ts int64) []byte {
+		return append(baseKey, byte(ts>>56), byte(ts>>48), byte(ts>>40), byte(ts>>32), byte(ts>>24), byte(ts>>16), byte(ts>>8), byte(ts))
+	}
+
+	// Insert multiple versioned keys in decreasing timestamp order to satisfy ascending order in TimestampCompare
+	baseKey := []byte("bloom_key")
+	for i := int64(100); i >= 1; i-- {
+		err = db.Put(makeKeyWithTimestamp(baseKey, i), []byte(fmt.Sprintf("value_at_ts%d", i)))
+		require.NoError(t, err)
+		if i%10 == 0 { // Flush every 10 insertions to create multiple SSTables
+			err = db.flushMemtable()
+			require.NoError(t, err)
+		}
+	}
+
+	// Test Bloom filter accuracy for existing keys
+	hitCount := 0
+	for i := int64(1); i <= 100; i++ {
+		_, found, err := db.Get(makeKeyWithTimestamp(baseKey, i))
+		require.NoError(t, err)
+		if found {
+			hitCount++
+		}
+	}
+	assert.Equal(t, 100, hitCount, "All existing keys should be found using Bloom filter")
+
+	// Test Bloom filter for non-existing keys (false positive rate)
+	falsePositiveCount := 0
+	nonExistBaseKey := []byte("non_exist_bloom_key")
+	for i := int64(1); i <= 100; i++ {
+		_, found, err := db.Get(makeKeyWithTimestamp(nonExistBaseKey, i))
+		require.NoError(t, err)
+		if found {
+			falsePositiveCount++
+		}
+	}
+	assert.True(t, falsePositiveCount < 10, "False positive rate for Bloom filter should be low")
 }

@@ -430,7 +430,7 @@ func (db *DB) flushMemtable() error {
 	// For now, this is a placeholder as the compaction logic in sstManager does not yet update metadata
 
 	db.arena = marena.NewArena(db.opts.ArenaSize)
-	db.memtable, err = mskip.NewSkipList(db.arena, bytes.Compare, uint64(time.Now().UnixNano()))
+	db.memtable, err = mskip.NewSkipList(db.arena, db.opts.Compare, uint64(time.Now().UnixNano()))
 	if err != nil {
 		return fmt.Errorf("failed to create new memtable: %w", err)
 	}
