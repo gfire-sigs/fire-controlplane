@@ -68,14 +68,12 @@ func wyhash(key unsafe.Pointer, len uintptr, seed uint64, secret *[4]uint64) uin
 	return _wymix(secret[1]^uint64(len), _wymix(a^secret[1], b^seed))
 }
 
-func wyrand(seed *uint64) uint64 {
+func WyRand(seed *uint64) uint64 {
 	*seed += 0xa0761d6478bd642f
 	return _wymix(*seed, *seed^0xe7037ed1a0b428db)
 }
 
-func WYRAND(seed *uint64) uint64 { return wyrand(seed) }
-
-func Hash(b []byte, seed uint64) uint64 {
+func WyHash(b []byte, seed uint64) uint64 {
 	return wyhash(
 		unsafe.Pointer(unsafe.SliceData(b)),
 		uintptr(len(b)),
@@ -84,7 +82,7 @@ func Hash(b []byte, seed uint64) uint64 {
 	)
 }
 
-func HashString(b string, seed uint64) uint64 {
+func WyHashString(b string, seed uint64) uint64 {
 	return wyhash(
 		unsafe.Pointer(unsafe.StringData(b)),
 		uintptr(len(b)),
@@ -93,6 +91,6 @@ func HashString(b string, seed uint64) uint64 {
 	)
 }
 
-func WYHASH_RAW(key unsafe.Pointer, len uintptr, seed uint64) uint64 {
+func WyHashRaw(key unsafe.Pointer, len uintptr, seed uint64) uint64 {
 	return wyhash(key, len, seed, &_wyp)
 }

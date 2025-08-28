@@ -9,6 +9,7 @@ import (
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/marena"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/splitmix64"
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/iterator"
 )
 
 const (
@@ -215,7 +216,7 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 
 	// Generate random level and allocate memory for new node
 	level := g.randLevel()
-	
+
 	var newNodeSize uint64 = uint64(sizeNode(level))
 	var newKeySize uint64 = uint64(len(key))
 
@@ -242,7 +243,7 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 
 	// Update next pointers at each level
 	for i := int32(0); i < level; i++ {
-		node.nexts[i] = g.getNode(log[i]).nexts[i]          // Set new node's next pointer
+		node.nexts[i] = g.getNode(log[i]).nexts[i]              // Set new node's next pointer
 		g.getNode(log[i]).nexts[i] = marena.Offset(newNodeSize) // Update previous node's next pointer
 	}
 
@@ -271,6 +272,8 @@ type SkipListIterator struct {
 	skl     *SkipList
 	current uint32
 }
+
+var _ iterator.Iterator = (*SkipListIterator)(nil)
 
 // Iterator creates and returns a new iterator for traversing the skiplist.
 // The iterator is initialized in an invalid state and must be positioned using

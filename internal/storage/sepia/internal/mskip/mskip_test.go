@@ -90,7 +90,7 @@ func TestSkipListInsert(t *testing.T) {
 
 	// Test 5: Value overwrite for existing key
 	value1_updated := []byte("value1_updated")
-	before = skl.seeklt(key1, &log)
+	_ = skl.seeklt(key1, &log)
 	newnode = skl.insertNext(&log, key1, value1_updated)
 	if newnode == 0 {
 		t.Fatalf("value overwrite failed")
@@ -207,7 +207,7 @@ func TestSkipListIterator(t *testing.T) {
 	}
 }
 
-// BenchmarkSkipList measures the performance of skiplist operations.
+// BenchmarkSkipListRandomSeek measures the performance of skiplist operations.
 // The benchmark:
 // 1. Creates a skiplist with 100MB arena capacity
 // 2. Inserts 1,000,000 sorted key-value pairs
@@ -217,7 +217,7 @@ func TestSkipListIterator(t *testing.T) {
 // - Memory allocation efficiency
 // - Search performance with random access patterns
 // - Skiplist level distribution effects
-func BenchmarkSkipList(b *testing.B) {
+func BenchmarkSkipListRandomSeek(b *testing.B) {
 	// Initialize arena with 100MB capacity
 	arena := marena.NewArena(100 << 20)
 
@@ -265,7 +265,7 @@ func BenchmarkSkipList(b *testing.B) {
 	}
 }
 
-// BenchmarkIteratorScan measures the performance of sequential scanning through
+// BenchmarkIteratorScanSequential measures the performance of sequential scanning through
 // the skiplist using an iterator. The benchmark:
 // 1. Creates a skiplist with 100MB arena capacity
 // 2. Inserts 1,000,000 sorted key-value pairs (same as BenchmarkSkipList)
@@ -275,7 +275,7 @@ func BenchmarkSkipList(b *testing.B) {
 // - Iterator initialization overhead
 // - Sequential access performance
 // - Memory access patterns for in-order traversal
-func BenchmarkIteratorScan(b *testing.B) {
+func BenchmarkIteratorScanSequential(b *testing.B) {
 	// Initialize arena with 100MB capacity
 	arena := marena.NewArena(100 << 20)
 
