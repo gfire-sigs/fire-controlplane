@@ -7,11 +7,14 @@ import (
 // Iterator defines the interface for iterating over key-value pairs.
 type Iterator interface {
 	First()
-	Next()
+	Seek(key []byte)
+
 	Valid() bool
+	Next()
+
 	Key() []byte
 	Value() []byte
-	Seek(key []byte)
+
 	Close()
 }
 
