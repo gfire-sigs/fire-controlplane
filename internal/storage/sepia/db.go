@@ -1,6 +1,8 @@
 package sepia
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -77,6 +79,17 @@ func (db *DB) Put(key, value []byte) error {
 	// For simplicity, just write raw data for now or use a proper batch format.
 	// Let's just write key/value to WAL for this task.
 	// In real DB, we write a batch.
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, seq)
+	buf.WriteByte(byte(TypeValue))
+	binary.Write(buf, binary.LittleEndian, int32(len(key)))
+	buf.Write(key)
+	binary.Write(buf, binary.LittleEndian, int32(len(value)))
+	buf.Write(value)
+
+	if err := db.wal.AddRecord(buf.Bytes()); err != nil {
+		return err
+	}
 
 	// Add to MemTable
 	if err := db.mem.Add(seq, TypeValue, key, value); err != nil {
@@ -133,6 +146,17 @@ func (db *DB) Delete(key []byte) error {
 
 	db.seq++
 	seq := db.seq
+
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, seq)
+	buf.WriteByte(byte(TypeDeletion))
+	binary.Write(buf, binary.LittleEndian, int32(len(key)))
+	buf.Write(key)
+	// No value for deletion
+
+	if err := db.wal.AddRecord(buf.Bytes()); err != nil {
+		return err
+	}
 
 	if err := db.mem.Add(seq, TypeDeletion, key, nil); err != nil {
 		return err

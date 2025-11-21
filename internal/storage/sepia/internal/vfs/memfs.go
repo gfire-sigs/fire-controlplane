@@ -170,3 +170,15 @@ func (fi *memFileInfo) Sys() interface{}   { return nil }
 func (fs *MemFileSystem) MkdirAll(path string, perm os.FileMode) error {
 	return nil
 }
+
+func (fs *MemFileSystem) List(dir string) ([]string, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	var names []string
+	for name := range fs.files {
+		// Simple prefix check for now, assuming flat structure or full paths
+		// In this test usage, we just want to find the WAL file.
+		names = append(names, name)
+	}
+	return names, nil
+}
