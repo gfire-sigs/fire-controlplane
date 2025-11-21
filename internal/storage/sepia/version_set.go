@@ -123,9 +123,7 @@ func (vs *VersionSet) LogAndApply(edit *VersionEdit) error {
 		}
 
 		// Add new files
-		for _, f := range edit.NewFiles[level] {
-			newVersion.Files[level] = append(newVersion.Files[level], f)
-		}
+		newVersion.Files[level] = append(newVersion.Files[level], edit.NewFiles[level]...)
 
 		// Sort files by MinKey
 		sort.Slice(newVersion.Files[level], func(i, j int) bool {
