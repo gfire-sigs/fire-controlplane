@@ -37,14 +37,9 @@ func (m *MemTable) Add(seq uint64, t ValueType, key, value []byte) error {
 	return nil
 }
 
-// Get looks up a key in the memtable.
+// Get looks up a key in the memtable and returns the latest version.
+// InternalKey ordering: UserKey asc, SeqNum desc (newer first)
 func (m *MemTable) Get(key []byte) (value []byte, err error) {
-	// We want the latest version of the key.
-	// Our comparator sorts UserKey asc, then SeqNum desc.
-	// So for a given UserKey, the FIRST entry has the highest (latest) SeqNum.
-	//
-	// Strategy: Iterate from the beginning until we find a matching UserKey.
-	// Since keys are sorted by UserKey first, once we find a match, it will be the latest version.
 	iter := m.skiplist.Iterator()
 	defer iter.Close()
 
@@ -53,14 +48,14 @@ func (m *MemTable) Get(key []byte) (value []byte, err error) {
 		internalKey := InternalKey(iter.Key())
 		cmp := bytes.Compare(internalKey.UserKey(), key)
 		if cmp == 0 {
-			// Found it. Check type.
+			// Found key - return value if not deleted
 			if internalKey.Type() == TypeValue {
 				return iter.Value(), nil
 			}
-			// Deleted
+			// Key was deleted
 			return nil, nil
 		} else if cmp > 0 {
-			// We've passed the key, it doesn't exist
+			// Passed the key location - not found
 			break
 		}
 		iter.Next()
@@ -73,7 +68,8 @@ func (m *MemTable) Iterator() *mskip.SkipListIterator {
 	return m.skiplist.Iterator()
 }
 
-// Size returns the approximate size of the memtable.
+// Size returns the approximate size of the memtable in bytes.
+// TODO: Implement actual size calculation based on arena usage.
 func (m *MemTable) Size() int {
 	return 0
 }

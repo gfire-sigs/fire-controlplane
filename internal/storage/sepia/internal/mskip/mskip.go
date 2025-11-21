@@ -18,21 +18,18 @@ const (
 	MSKIP_MAX_LEVEL = 24
 )
 
-// Memory layout of mskipNode in arena:
-//
-// key_ptr: uint64      // Pointer to key bytes in arena
-// value_ptr: uint64    // Pointer to value bytes in arena
-// level: int32        // Current level of the node (1 to MSKIP_MAX_LEVEL)
-// reserved: 4 bytes   // Padding for alignment
-// nexts: uint32[level] // Array of pointers to next nodes at each level
+// Memory layout of mskipNode in arena (variable size based on level):
+// - key_ptr: uint64    // Arena offset of key bytes
+// - value_ptr: uint64  // Arena offset of value bytes
+// - level: int32       // Node height (1 to MSKIP_MAX_LEVEL)
+// - padding: 4 bytes   // Alignment padding
+// - nexts: uint32[]   // Next pointers (only 'level' entries used)
 
-// mskipNode represents a node in the skiplist.
-// The actual size allocated depends on the node's level.
 type mskipNode struct {
-	keyPtr   uint64                  // Arena offset of the key bytes
-	valuePtr uint64                  // Arena offset of the value bytes
-	level    int32                   // Height of this node
-	nexts    [MSKIP_MAX_LEVEL]uint32 // Next pointers at each level (only level entries are used)
+	keyPtr   uint64                  // Arena offset of key
+	valuePtr uint64                  // Arena offset of value
+	level    int32                   // Node height
+	nexts    [MSKIP_MAX_LEVEL]uint32 // Next pointers
 }
 
 // Memory layout constants for mskipNode struct.
@@ -148,61 +145,42 @@ func (g *SkipList) getNode(ptr uint32) *mskipNode {
 	return (*mskipNode)(unsafe.Pointer(g.arena.Index(ptr)))
 }
 
-// seeklt finds the node with the largest key less than the given key.
-// It traverses the skiplist from top to bottom, recording the path if log is provided.
-// The path recording is essential for insertion operations.
-//
-// Parameters:
-//   - key: The key to search for
-//   - log: Optional array to record the search path (required for insertions)
-//
-// Returns the arena offset of the found node.
+// seeklt finds the largest node with key < target, recording search path.
+// Used by insert operations to locate insertion point.
 func (g *SkipList) seeklt(key []byte, log *[MSKIP_MAX_LEVEL]uint32) uint32 {
 	ptr := g.head
 
-	// Create dummy log if none provided
+	// Use dummy log if none provided
 	var dummyLog [MSKIP_MAX_LEVEL]uint32
 	if log == nil {
 		log = &dummyLog
 	}
 
-	// Search from top level to bottom, recording path
+	// Search from top to bottom, recording insertion path
 	for i := MSKIP_MAX_LEVEL - 1; i >= 0; i-- {
 		for {
 			next := g.getNode(ptr).nexts[i]
 			if next == marena.ARENA_INVALID_ADDRESS {
-				break // No more nodes at this level
+				break
 			}
 			if g.compare(key, g.arena.View(g.getNode(next).keyPtr)) <= 0 {
-				break // Found a key >= target key
+				break // Found key >= target
 			}
-
-			ptr = next // Move forward at current level
+			ptr = next // Move forward
 		}
-		log[i] = ptr // Record path at this level
+		log[i] = ptr // Record path for insertion
 	}
 
 	return ptr
 }
 
-// insertNext inserts a new key-value pair into the skiplist after the nodes specified in log.
-// If the key already exists, it updates the value and returns the existing node.
-//
-// Parameters:
-//   - log: Array containing the path to the insertion point (from seeklt)
-//   - key: Key to insert
-//   - value: Value to associate with the key
-//
-// Returns:
-//   - The arena offset of the inserted/updated node
-//   - ARENA_INVALID_ADDRESS if memory allocation fails
+// insertNext inserts key-value after nodes in log, updating if key exists.
 func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []byte) uint32 {
-	// Check if key already exists
+	// Check for existing key and update if found
 	next := g.getNode(log[0]).nexts[0]
 	if next != marena.ARENA_INVALID_ADDRESS && g.compare(key, g.arena.View(g.getNode(next).keyPtr)) == 0 {
-		// Key exists - update value
 		if value == nil {
-			g.getNode(next).valuePtr = marena.ARENA_INVALID_ADDRESS // Mark as deleted
+			g.getNode(next).valuePtr = marena.ARENA_INVALID_ADDRESS // Delete
 		} else {
 			newValueAddr := g.arena.Allocate(len(value))
 			if newValueAddr == marena.ARENA_INVALID_ADDRESS {
@@ -214,24 +192,24 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 		return next
 	}
 
-	// Generate random level and allocate memory for new node
+	// Create new node with random level
 	level := g.randLevel()
+	newNodeSize := uint64(sizeNode(level))
+	newKeySize := uint64(len(key))
 
-	var newNodeSize uint64 = uint64(sizeNode(level))
-	var newKeySize uint64 = uint64(len(key))
-
-	// Allocate for node and key first
+	// Allocate memory for node and key
 	if !g.arena.AllocateMultiple(&newNodeSize, &newKeySize) {
 		return marena.ARENA_INVALID_ADDRESS
 	}
 
+	// Initialize new node
 	node := g.getNode(marena.Offset(newNodeSize))
 	node.level = level
 	node.keyPtr = newKeySize
 	copy(g.arena.View(node.keyPtr), key)
 
 	if value == nil {
-		node.valuePtr = marena.ARENA_INVALID_ADDRESS // Mark as deleted
+		node.valuePtr = marena.ARENA_INVALID_ADDRESS
 	} else {
 		newValueAddr := g.arena.Allocate(len(value))
 		if newValueAddr == marena.ARENA_INVALID_ADDRESS {
@@ -241,7 +219,7 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 		node.valuePtr = newValueAddr
 	}
 
-	// Update next pointers at each level
+	// Link node into skiplist at each level
 	for i := int32(0); i < level; i++ {
 		node.nexts[i] = g.getNode(log[i]).nexts[i]
 		g.getNode(log[i]).nexts[i] = marena.Offset(newNodeSize)
@@ -269,20 +247,16 @@ var iteratorPool sync.Pool = sync.Pool{
 	},
 }
 
-// SkipListIterator provides bidirectional iteration over skiplist entries.
-// It maintains its position in the skiplist and supports forward/backward traversal
-// as well as seeking to specific positions.
+// SkipListIterator provides forward/backward iteration over skiplist entries.
 type SkipListIterator struct {
 	skl     *SkipList
-	current uint32
+	current uint32 // Current node offset
 }
 
 var _ iterator.Iterator = (*SkipListIterator)(nil)
 
-// Iterator creates and returns a new iterator for traversing the skiplist.
-// The iterator is initialized in an invalid state and must be positioned using
-// First(), SeekLT(), or SeekLE() before use. The returned iterator must be
-// closed when no longer needed.
+// Iterator returns a new iterator for traversing the skiplist.
+// Iterator must be positioned using First(), Seek(), etc. before use.
 func (g *SkipList) Iterator() *SkipListIterator {
 	g.IncRef()
 	iter := iteratorPool.Get().(*SkipListIterator)
@@ -299,21 +273,18 @@ func (g *SkipListIterator) First() {
 	g.Next()
 }
 
-// SeekLT (Seek Less Than) positions the iterator at the largest key strictly less than
-// the provided key. If no such key exists, the iterator becomes invalid.
+// SeekLT positions iterator at largest key < target.
 func (g *SkipListIterator) SeekLT(key []byte) {
 	var log [MSKIP_MAX_LEVEL]uint32
 	g.current = g.skl.seeklt(key, &log)
 }
 
-// SeekLE (Seek Less than or Equal) positions the iterator at the largest key
-// less than or equal to the provided key. If the key exists, the iterator
-// will be positioned at that exact key. If no such key exists, the iterator
-// becomes invalid.
+// SeekLE positions iterator at largest key <= target.
 func (g *SkipListIterator) SeekLE(key []byte) {
 	var log [MSKIP_MAX_LEVEL]uint32
 	prevNodePtr := g.skl.seeklt(key, &log)
 
+	// Handle case where prev is head node
 	if prevNodePtr == g.skl.head {
 		firstNodePtr := g.skl.getNode(g.skl.head).nexts[0]
 		if firstNodePtr != marena.ARENA_INVALID_ADDRESS {
@@ -329,6 +300,7 @@ func (g *SkipListIterator) SeekLE(key []byte) {
 		return
 	}
 
+	// Check if next node matches exactly
 	g.current = prevNodePtr
 	nextNodePtr := g.skl.getNode(g.current).nexts[0]
 	if nextNodePtr != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(nextNodePtr).keyPtr)) == 0 {

@@ -42,12 +42,12 @@ func NewCompactionJob(vs *VersionSet, fs vfs.FileSystem, level int, inputs []*Fi
 	}
 }
 
-// Run executes the compaction.
+// Run executes compaction: merges input files into a new output file.
+// Returns VersionEdit describing the changes made.
 func (c *CompactionJob) Run() (*VersionEdit, error) {
-	// Create iterators for all inputs
+	// Create iterators for all input SST files
 	var iters []iterator.Iterator
 	for _, f := range c.inputs {
-		// Open SST reader
 		file, err := c.fs.Open(fmt.Sprintf("%s/%06d.sst", c.vs.basePath, f.FileNum))
 		if err != nil {
 			return nil, err
@@ -60,14 +60,11 @@ func (c *CompactionJob) Run() (*VersionEdit, error) {
 		iters = append(iters, r.NewIterator())
 	}
 
-	// Merge iterators
-	// For Level 0, we just merge all files.
-	// For Level > 0, we should use ConcatenatingIterator if they are sorted and non-overlapping.
-	// But MergeIterator works for all cases (just less efficient for non-overlapping).
+	// Merge all input iterators (handles overlapping keys)
 	mergedIter := iterator.NewMergeIterator(iters)
 	defer mergedIter.Close()
 
-	// Output file
+	// Create output SST file
 	fileNum := c.vs.NewFileNumber()
 	filename := fmt.Sprintf("%s/%06d.sst", c.vs.basePath, fileNum)
 	f, err := c.fs.Create(filename)
@@ -81,14 +78,13 @@ func (c *CompactionJob) Run() (*VersionEdit, error) {
 		return nil, err
 	}
 
-	// Iterate and write
+	// Process merged entries and write to output
 	mergedIter.First()
 	for mergedIter.Valid() {
 		key := mergedIter.Key()
 		val := mergedIter.Value()
 
-		// Apply MergePolicy
-		// Extract TS from key
+		// Apply merge policy to filter old entries
 		ts := ExtractTS(key)
 		if c.mergePolicy.ShouldDrop(key, ts) {
 			mergedIter.Next()
@@ -106,17 +102,16 @@ func (c *CompactionJob) Run() (*VersionEdit, error) {
 		return nil, err
 	}
 
-	// Create VersionEdit
+	// Create version edit to remove input files and add output
 	edit := NewVersionEdit()
 	for _, input := range c.inputs {
 		edit.DeleteFile(c.level, input.FileNum)
 	}
 
-	// Add new file to next level
+	// TODO: Get actual file size from writer
 	meta := &FileMetadata{
 		FileNum:  fileNum,
-		FileSize: 0, // TODO: Get size from file or writer
-		// MinKey: w.MinKey, ...
+		FileSize: 0,
 	}
 	edit.AddFile(c.level+1, meta)
 

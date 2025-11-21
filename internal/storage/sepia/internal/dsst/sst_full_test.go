@@ -183,11 +183,8 @@ func TestCorruption(t *testing.T) {
 	data[len(data)/2] ^= 0xFF
 
 	// Write back
-	f, err = fs.Open("corrupt.sst") // Open for writing (MemFS Open returns ReadWriter handle if it exists)
-	// Wait, MemFS Open returns a handle that shares data but has independent pos.
-	// But we need to overwrite. MemFS doesn't have Truncate or similar easily exposed via File interface?
-	// File interface has WriterAt.
-	// Let's just use WriteAt on the handle we get from Open.
+	f, err = fs.Open("corrupt.sst") // MemFS Open returns ReadWriter handle
+	// Use WriteAt to modify specific file position
 	if err != nil {
 		t.Fatal(err)
 	}

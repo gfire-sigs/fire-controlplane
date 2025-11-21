@@ -71,7 +71,7 @@ func NewWriter(file vfs.File, opts *Options) (*Writer, error) {
 }
 
 func (w *Writer) writeHeader() error {
-	// Magic (4) + Version (4) + Encrypted DEK (variable)
+	// Write SST file header: Magic(4) + Version(4) + DEK(len+data)
 	var buf [8]byte
 	binary.LittleEndian.PutUint32(buf[0:], Magic)
 	binary.LittleEndian.PutUint32(buf[4:], Version)
@@ -80,12 +80,12 @@ func (w *Writer) writeHeader() error {
 	}
 	w.offset += 8
 
+	// Encrypt and write Data Encryption Key
 	encryptedDEK, err := w.encryptor.EncryptDEK()
 	if err != nil {
 		return err
 	}
 
-	// Write DEK length + DEK
 	var dekLenBuf [4]byte
 	binary.LittleEndian.PutUint32(dekLenBuf[:], uint32(len(encryptedDEK)))
 	if _, err := w.file.Write(dekLenBuf[:]); err != nil {
@@ -172,36 +172,31 @@ func (w *Writer) flushBlock() error {
 		return nil
 	}
 
-	// Get last key for index
+	// Get block data and last key for index
 	lastKey := append([]byte(nil), w.blockBuilder.lastKey...)
-
 	blockData := w.blockBuilder.Finish()
 
-	// Compress (TODO: Snappy)
+	// TODO: Implement compression (Snappy)
 
-	// Encrypt
-	// We use a new IV for each block. For simplicity, we can use the offset as IV (padded).
-	// In production, use a random IV or a counter.
+	// Encrypt block with unique IV
 	iv := make([]byte, 16)
 	binary.LittleEndian.PutUint64(iv, uint64(w.offset))
 
-	// Write block handle to index: last_key -> offset, size
-	// Value in index is varint(offset) + varint(size)
+	// Add block entry to index: last_key -> (offset,size)
 	var handleBuf [binary.MaxVarintLen64 * 2]byte
 	n := binary.PutUvarint(handleBuf[0:], uint64(w.offset))
-	n += binary.PutUvarint(handleBuf[n:], uint64(len(blockData))) // Encrypted size will be same as plaintext for CTR
+	n += binary.PutUvarint(handleBuf[n:], uint64(len(blockData)))
 
 	if err := w.indexBuilder.Add(lastKey, handleBuf[:n], 0); err != nil {
 		return err
 	}
 
-	// Write IV
+	// Write IV, encrypted data, and checksum
 	if _, err := w.file.Write(iv); err != nil {
 		return err
 	}
 	w.offset += 16
 
-	// Write Encrypted Data
 	sw, err := w.encryptor.NewStreamWriter(w.file, iv)
 	if err != nil {
 		return err
@@ -211,7 +206,6 @@ func (w *Writer) flushBlock() error {
 	}
 	w.offset += int64(len(blockData))
 
-	// Write Checksum (CRC32 of unencrypted data)
 	checksum := crc32.ChecksumIEEE(blockData)
 	var crcBuf [4]byte
 	binary.LittleEndian.PutUint32(crcBuf[:], checksum)
@@ -224,25 +218,24 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
-// Close finishes writing the SST file.
+// Close finalizes SST file by writing all remaining blocks and metadata.
 func (w *Writer) Close() error {
 	if w.closed {
 		return w.err
 	}
 
-	// Flush pending data block
+	// Flush any pending data block
 	if err := w.flushBlock(); err != nil {
 		w.err = err
 		return err
 	}
 
-	// Write Filter Block
+	// Write bloom filter block if enabled
 	var filterOffset, filterSize uint64
 	if w.options.BloomBitsPerKey > 0 && len(w.keys) > 0 {
 		filterData := w.filter.CreateFilter(w.keys)
 		filterOffset = uint64(w.offset)
 		filterSize = uint64(len(filterData))
-
 		if _, err := w.file.Write(filterData); err != nil {
 			w.err = err
 			return err
@@ -250,14 +243,13 @@ func (w *Writer) Close() error {
 		w.offset += int64(len(filterData))
 	}
 
-	// Write Range Tombstone Block
+	// Write range tombstone block if any
 	var rangeTombstoneOffset, rangeTombstoneSize uint64
 	if !w.rangeTombstoneBuilder.IsEmpty() {
 		rtData := w.rangeTombstoneBuilder.Finish()
 		rangeTombstoneOffset = uint64(w.offset)
 		rangeTombstoneSize = uint64(len(rtData))
 
-		// Encrypt Range Tombstones
 		iv := make([]byte, 16)
 		binary.LittleEndian.PutUint64(iv, uint64(w.offset))
 		if _, err := w.file.Write(iv); err != nil {
@@ -278,12 +270,9 @@ func (w *Writer) Close() error {
 		w.offset += int64(len(rtData))
 	}
 
-	// Write Index Block
+	// Write index block
 	indexOffset := uint64(w.offset)
 	indexData := w.indexBuilder.Finish()
-	// Index is not encrypted in this simple version, but typically should be.
-	// For this task, let's write it plain for simplicity or encrypt it similarly.
-	// Let's encrypt it for consistency.
 	iv := make([]byte, 16)
 	binary.LittleEndian.PutUint64(iv, uint64(w.offset))
 	if _, err := w.file.Write(iv); err != nil {
@@ -304,12 +293,11 @@ func (w *Writer) Close() error {
 	w.offset += int64(len(indexData))
 	indexSize := uint64(len(indexData))
 
-	// Write Properties Block
-	// MinKeyLen(varint) + MinKey + MaxKeyLen(varint) + MaxKey + MinTS(8) + MaxTS(8)
+	// Write properties block (min/max keys and timestamps)
 	var propsBuf bytes.Buffer
+	var buf [binary.MaxVarintLen64]byte
 
 	// MinKey
-	var buf [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(buf[:], uint64(len(w.minKey)))
 	propsBuf.Write(buf[:n])
 	propsBuf.Write(w.minKey)
@@ -332,7 +320,7 @@ func (w *Writer) Close() error {
 	propsOffset := uint64(w.offset)
 	propsSize := uint64(len(propsData))
 
-	// Encrypt Properties
+	// Encrypt properties
 	iv = make([]byte, 16)
 	binary.LittleEndian.PutUint64(iv, uint64(w.offset))
 	if _, err := w.file.Write(iv); err != nil {
@@ -352,8 +340,7 @@ func (w *Writer) Close() error {
 	}
 	w.offset += int64(len(propsData))
 
-	// Write Footer
-	// Index Offset (8), Index Size (8), Filter Offset (8), Filter Size (8), Props Offset (8), Props Size (8), RangeTombstone Offset (8), RangeTombstone Size (8), Magic (4)
+	// Write footer with all block offsets and sizes
 	var footer [68]byte
 	binary.LittleEndian.PutUint64(footer[0:], indexOffset)
 	binary.LittleEndian.PutUint64(footer[8:], indexSize)

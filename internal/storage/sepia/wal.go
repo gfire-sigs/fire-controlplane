@@ -8,11 +8,10 @@ import (
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/vfs"
 )
 
-// LogWriter writes records to a WAL file.
-// Format: Checksum (4) + Length (2) + Type (1) + Data.
-// Type: 1 = Full, 2 = First, 3 = Middle, 4 = Last.
-// Type: 1 = Full, 2 = First, 3 = Middle, 4 = Last.
-// We use Full records for now.
+// LogWriter writes records to Write-Ahead Log (WAL) for durability.
+// Record format: Checksum(4) + Length(2) + Type(1) + Data
+// Type values: 1=Full, 2=First, 3=Middle, 4=Last
+// Currently only uses Full records (Type=1).
 type LogWriter struct {
 	file vfs.File
 }
@@ -22,20 +21,20 @@ func NewLogWriter(file vfs.File) *LogWriter {
 }
 
 func (w *LogWriter) AddRecord(data []byte) error {
-	// Header: Checksum (4) + Length (2) + Type (1)
-	// Type 1 = Full
+	// Write record header: Checksum(4) + Length(2) + Type(1)
 	header := make([]byte, 7)
 	length := len(data)
 	binary.LittleEndian.PutUint16(header[4:], uint16(length))
-	header[6] = 1 // Full Type
+	header[6] = 1 // Full record type
 
-	// Checksum covers Type + Data
+	// Calculate checksum over Type + Data
 	crc := crc32.NewIEEE()
 	crc.Write(header[6:])
 	crc.Write(data)
 	sum := crc.Sum32()
 	binary.LittleEndian.PutUint32(header[:4], sum)
 
+	// Write header, data, and sync to disk
 	if _, err := w.file.Write(header); err != nil {
 		return err
 	}
@@ -49,10 +48,10 @@ func (w *LogWriter) Close() error {
 	return w.file.Close()
 }
 
-// LogReader reads records from a WAL file.
+// LogReader reads records from a Write-Ahead Log (WAL) file.
 type LogReader struct {
 	file vfs.File
-	buf  []byte
+	buf  []byte // Read buffer
 }
 
 func NewLogReader(file vfs.File) *LogReader {
@@ -63,7 +62,7 @@ func NewLogReader(file vfs.File) *LogReader {
 }
 
 func (r *LogReader) ReadRecord() ([]byte, error) {
-	// Read Header
+	// Read and validate record header
 	header := make([]byte, 7)
 	if _, err := io.ReadFull(r.file, header); err != nil {
 		return nil, err
@@ -73,21 +72,22 @@ func (r *LogReader) ReadRecord() ([]byte, error) {
 	length := binary.LittleEndian.Uint16(header[4:])
 	typ := header[6]
 
+	// Read record data
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r.file, data); err != nil {
 		return nil, err
 	}
 
-	// Verify Checksum
+	// Verify checksum
 	crc := crc32.NewIEEE()
 	crc.Write(header[6:])
 	crc.Write(data)
 	if crc.Sum32() != sum {
-		return nil, io.ErrUnexpectedEOF // Checksum mismatch
+		return nil, io.ErrUnexpectedEOF
 	}
 
+	// TODO: Implement fragmented record handling (Types 2,3,4)
 	if typ != 1 {
-		// TODO: Handle fragmentation
 		return nil, io.ErrUnexpectedEOF
 	}
 

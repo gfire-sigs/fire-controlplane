@@ -83,8 +83,7 @@ func (db *DB) Put(key, value []byte) error {
 	db.seq++
 	seq := db.seq
 
-	// Write to WAL
-	// Format: Seq(8) + Type(1) + KeyLen(varint) + Key + ValueLen(varint) + Value
+	// Write to WAL with format: Seq(8) + Type(1) + KeyLen(varint) + Key + ValueLen(varint) + Value
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, seq)
 	buf.WriteByte(byte(TypeValue))
@@ -102,10 +101,8 @@ func (db *DB) Put(key, value []byte) error {
 		return err
 	}
 
-	// Check for compaction/flush
-	if db.mem.Size() > 4*1024*1024 { // 4MB limit
-		// Trigger flush
-		// For now, just rotate synchronously (blocking)
+	// Trigger flush when memtable exceeds 4MB limit
+	if db.mem.Size() > 4*1024*1024 {
 		if err := db.makeRoomForWrite(); err != nil {
 			return err
 		}
@@ -119,27 +116,21 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	// 1. Check MemTable
-	val, err := db.mem.Get(key)
-	if err != nil {
+	// Search order: MemTable -> Immutable MemTable -> SST files
+	if val, err := db.mem.Get(key); err != nil {
 		return nil, err
-	}
-	if val != nil {
+	} else if val != nil {
 		return val, nil
 	}
 
-	// 2. Check Immutable MemTable
 	if db.imm != nil {
-		val, err := db.imm.Get(key)
-		if err != nil {
+		if val, err := db.imm.Get(key); err != nil {
 			return nil, err
-		}
-		if val != nil {
+		} else if val != nil {
 			return val, nil
 		}
 	}
 
-	// 3. Check SSTs (VersionSet)
 	if val, err := db.versions.current.Get(key, db.opts); err != nil {
 		return nil, err
 	} else if val != nil {
@@ -185,17 +176,15 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) makeRoomForWrite() error {
-	// Rotate MemTable
+	// Rotate memtable: current becomes immutable, new one created
 	if db.imm != nil {
-		// Wait for background flush to finish
-		// For this task, we just error or block.
 		return errors.New("memtable full and flush in progress")
 	}
 
 	db.imm = db.mem
 	db.mem = NewMemTable(db.opts.Comparator)
 
-	// Create new WAL
+	// Create new WAL file
 	if db.wal != nil {
 		db.wal.Close()
 	}
@@ -205,7 +194,7 @@ func (db *DB) makeRoomForWrite() error {
 	}
 	db.wal = NewLogWriter(walFile)
 
-	// Trigger Flush in background
+	// Flush immutable memtable to SST in background
 	go func() {
 		db.flushMemTable(db.imm)
 		db.mu.Lock()
@@ -217,57 +206,33 @@ func (db *DB) makeRoomForWrite() error {
 }
 
 func (db *DB) flushMemTable(mem *MemTable) {
-	// Write MemTable to SST
-	// ...
-	// Create CompactionJob for L0?
-	// Or just write L0 file.
-
+	// Convert memtable to SST file and update version
 	fileNum := db.versions.NewFileNumber()
 	filename := fmt.Sprintf("%s/%06d.sst", db.opts.Dir, fileNum)
 	f, err := db.opts.FileSystem.Create(filename)
 	if err != nil {
-		// Log error
 		return
 	}
 
 	sstOpts := dsst.DefaultOptions()
-	// Configure sstOpts from db.opts
-
 	w, err := dsst.NewWriter(f, sstOpts)
 	if err != nil {
 		return
 	}
 
+	// Iterate through memtable entries and write to SST
 	iter := mem.Iterator()
-	iter.First() // Start
-	// mskip iterator iterates sorted.
-	// We need to iterate and add to writer.
-	// But mskip iterator returns InternalKey bytes directly?
-	// Yes, Insert took []byte.
-
+	iter.First()
 	for iter.Valid() {
-		// Key is InternalKey
-		// Value is user value
-		// Writer.Add expects UserKey?
-		// Wait, Writer.Add(key, value).
-		// If we pass InternalKey as key, Writer will treat it as UserKey and add footer?
-		// No, Writer is generic.
-		// But Writer has KeyTSExtractor.
-		// If we pass InternalKey, we need KeyTSExtractor to extract TS from it.
-		// And Writer writes key as is.
-		// So yes, we pass InternalKey as "key" to Writer.
-
+		// InternalKey contains user key + sequence + type
+		// Writer stores it as-is for proper ordering
 		w.Add(iter.Key(), iter.Value())
 		iter.Next()
 	}
 
 	w.Close()
 
-	// Update Version
-	// We need to convert InternalKey to InternalKey to store in FileMetadata?
-	// FileMetadata expects InternalKey.
-	// dsst.Writer.MinKey() returns the raw key passed to Add(), which is InternalKey.
-	// So we can just cast it.
+	// Update version with new SST file metadata
 	minKey := InternalKey(w.MinKey())
 	maxKey := InternalKey(w.MaxKey())
 
@@ -279,7 +244,6 @@ func (db *DB) flushMemTable(mem *MemTable) {
 		MaxKey:   maxKey,
 	})
 
-	// Get file size
 	if stat, err := f.Stat(); err == nil {
 		edit.NewFiles[0][0].FileSize = uint64(stat.Size())
 	}
@@ -288,66 +252,20 @@ func (db *DB) flushMemTable(mem *MemTable) {
 }
 
 func (db *DB) recover() error {
-	// 1. List files
+	// Recover from WAL files to restore database state
 	files, err := db.opts.FileSystem.List(db.opts.Dir)
 	if err != nil {
 		return err
 	}
 
-	// 2. Find latest WAL
-	var walFile string
-	var maxWalTs int64
+	// Find and replay all WAL files
 	for _, f := range files {
-		if n, err := fmt.Sscanf(f, "wal-%d.log", &maxWalTs); err == nil && n == 1 {
-			// Assuming simple format check.
-			// Actually Sscanf might match partial?
-			// Let's use strings.HasPrefix and suffix.
-			// But memfs returns full paths or names?
-			// memfs.List returns names (keys in map).
-			// In Open, we create "dir/wal-ts.log".
-			// So name might contain dir prefix if memfs is simple.
-			// But List implementation in memfs returns just keys.
-			// If keys are full paths, we need to check that.
-			if f > walFile {
-				walFile = f
-			}
-		}
-	}
-
-	// Better WAL finding logic:
-	// We want the LATEST WAL.
-	// The naming is wal-<timestamp>.log.
-	// String comparison works for timestamp if fixed width, but they are not.
-	// But they are likely close.
-	// Let's just look for all wal files and pick the one with largest timestamp.
-
-	// Actually, Open() creates a NEW WAL.
-	// So we should recover from the PREVIOUS WAL(s).
-	// But for this task, let's assume we just recover from any existing WALs that are not the one we just created?
-	// Wait, Open() created a new WAL at line 53.
-	// So if we list now, we will see the new one too.
-	// We should recover from *older* WALs.
-	// Or, we should have recovered BEFORE creating the new WAL.
-	// Yes, typically recovery happens before opening new WAL.
-	// But I can't easily change the order in Open without rewriting it.
-	// I'll just skip the current WAL (empty) or replay it (no op).
-	// Actually, if I replay all WALs, it should be fine.
-
-	// Let's refine Open() to call recover BEFORE creating new WAL?
-	// That would be cleaner.
-	// But I am using multi_replace on existing structure.
-	// I will just replay all WALs found.
-
-	for _, f := range files {
-		// Check if it is a WAL file
-		// We need to handle full paths if memfs returns them.
-		// memfs.List returns keys. In Open we used "dir/wal...".
-		// So keys are full paths.
+		// Check if file is a WAL (format: wal-<timestamp>.log)
 		if !strings.Contains(f, "/wal-") || !strings.HasSuffix(f, ".log") {
 			continue
 		}
 
-		// Open WAL
+		// Open and replay WAL file
 		file, err := db.opts.FileSystem.Open(f)
 		if err != nil {
 			return err
@@ -360,14 +278,10 @@ func (db *DB) recover() error {
 				if err == io.EOF {
 					break
 				}
-				// Ignore partial records at end?
 				break
 			}
 
-			// Parse batch
-			// Format: Seq(8) + Type(1) + KeyLen(varint) + Key + ValueLen(varint) + Value
-			// Note: db.Put writes raw data as a record.
-
+			// Parse WAL record: Seq(8) + Type(1) + KeyLen(varint) + Key + ValueLen(varint) + Value
 			buf := bytes.NewReader(data)
 			var seq uint64
 			if err := binary.Read(buf, binary.LittleEndian, &seq); err != nil {
@@ -401,12 +315,10 @@ func (db *DB) recover() error {
 				}
 			}
 
-			// Update DB seq
+			// Update sequence number and replay to memtable
 			if seq > db.seq {
 				db.seq = seq
 			}
-
-			// Add to MemTable
 			db.mem.Add(seq, t, key, value)
 		}
 		file.Close()

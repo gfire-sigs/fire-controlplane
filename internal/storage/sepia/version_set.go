@@ -92,11 +92,12 @@ func NewVersionSet(basePath string, fs vfs.FileSystem) *VersionSet {
 	}
 }
 
-// LogAndApply applies a VersionEdit to the current version and writes to Manifest.
+// LogAndApply applies a VersionEdit to create new version and updates manifest.
 func (vs *VersionSet) LogAndApply(edit *VersionEdit) error {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
+	// Update metadata from edit
 	if edit.LogNumber != 0 {
 		vs.logNumber = edit.LogNumber
 	}
@@ -107,10 +108,10 @@ func (vs *VersionSet) LogAndApply(edit *VersionEdit) error {
 		vs.lastSequence = edit.LastSequence
 	}
 
-	// Apply to current version to create new version
+	// Create new version by applying edits to current
 	newVersion := NewVersion()
 	for level := 0; level < NumLevels; level++ {
-		// Add existing files that are not deleted
+		// Keep existing files that are not deleted
 		deleted := make(map[uint64]bool)
 		for _, f := range edit.DeletedFiles[level] {
 			deleted[f] = true
@@ -122,33 +123,15 @@ func (vs *VersionSet) LogAndApply(edit *VersionEdit) error {
 			}
 		}
 
-		// Add new files
+		// Add new files and sort by MinKey
 		newVersion.Files[level] = append(newVersion.Files[level], edit.NewFiles[level]...)
-
-		// Sort files by MinKey
 		sort.Slice(newVersion.Files[level], func(i, j int) bool {
 			return bytes.Compare(newVersion.Files[level][i].MinKey, newVersion.Files[level][j].MinKey) < 0
 		})
 	}
 
-	// Write to Manifest
-	// For simplicity, we use a JSON manifest for now.
-	// In production, use a binary log format (like WAL).
-	manifestPath := fmt.Sprintf("%s/MANIFEST-%06d", vs.basePath, vs.manifestFileNum)
-	// f, err := vs.fs.Create(manifestPath) // Overwrite or Append? Usually append.
-	// For now, just print to stdout or ignore to fix lint
-	_ = manifestPath
-	// If we create a new manifest file every time, it's safer but slower.
-	// Let's assume we append to existing if open, or create new.
-	// For this task, let's just write a new one or append.
-	// Let's just write the edit as JSON line.
-
-	// Actually, we need to maintain a MANIFEST file handle.
-	// Let's skip persistent manifest for this task unless required?
-	// "Implement Version/Manifest management".
-	// I'll implement a simple JSON append to a CURRENT manifest.
-
-	// ... (Manifest writing logic omitted for brevity, assuming in-memory for now or simple file)
+	// TODO: Implement persistent manifest writing
+	// For now, maintain in-memory version only
 
 	vs.current.Unref()
 	vs.current = newVersion
@@ -168,69 +151,63 @@ func (vs *VersionSet) Level0Files() []*FileMetadata {
 	return vs.current.Files[0]
 }
 
-// PickCompaction picks a level to compact.
-// Leveled Compaction:
-// Level 0: Overlapping keys allowed. Compaction triggered by count (e.g. 4 files).
-// Level > 0: Non-overlapping. Compaction triggered by size (e.g. 10MB * 10^L).
+// PickCompaction selects a level and files for compaction based on:
+// - Level 0: compact when file count >= 4 (overlapping keys)
+// - Level > 0: compact when size exceeds threshold (10MB * 10^level)
 func (vs *VersionSet) PickCompaction() (int, []*FileMetadata) {
 	vs.mu.Lock()
 	defer vs.mu.Unlock()
 
-	// Level 0
+	// Check Level 0 for file count trigger
 	if len(vs.current.Files[0]) >= 4 {
-		return 0, vs.current.Files[0] // Compact all L0 for simplicity
+		return 0, vs.current.Files[0]
 	}
 
-	// Other levels
+	// Check other levels for size trigger
 	for level := 1; level < NumLevels-1; level++ {
 		totalSize := uint64(0)
 		for _, f := range vs.current.Files[level] {
 			totalSize += f.FileSize
 		}
-		targetSize := uint64(10 * 1024 * 1024) // 10MB base
+
+		// Calculate target size: 10MB * 10^level
+		targetSize := uint64(10 * 1024 * 1024)
 		for i := 0; i < level; i++ {
 			targetSize *= 10
 		}
 
 		if totalSize > targetSize {
-			// Pick one file to compact
-			// Ideally pick file that overlaps most with next level or round robin.
-			// Simple: Pick first file.
+			// TODO: Implement smarter file selection (overlap-based)
 			return level, []*FileMetadata{vs.current.Files[level][0]}
 		}
 	}
 
-	return -1, nil
+	return -1, nil // No compaction needed
 }
 
-// Get looks up a key in the version.
+// Get searches for a key across all levels, returning the value or nil if not found.
+// Search order: Level 0 (newest to oldest) -> Level 1+ (binary search)
 func (v *Version) Get(key []byte, opts *Options) ([]byte, error) {
-	// 1. Level 0: files may overlap, so we must check all of them from newest to oldest.
-	// In our list, they are appended, so newest is at the end?
-	// VersionSet.LogAndApply appends new files. So yes, later indices are newer.
-	// We should iterate backwards.
+	// Level 0: files may overlap, search from newest to oldest
 	for i := len(v.Files[0]) - 1; i >= 0; i-- {
 		f := v.Files[0][i]
-		// Check key range
 		if bytes.Compare(key, f.MinKey.UserKey()) >= 0 && bytes.Compare(key, f.MaxKey.UserKey()) <= 0 {
-			val, err := v.getFromFile(f, key, opts)
-			if err != nil {
+			if val, err := v.getFromFile(f, key, opts); err != nil {
 				return nil, err
-			}
-			if val != nil {
+			} else if val != nil {
 				return val, nil
 			}
 		}
 	}
 
-	// 2. Level > 0: files are sorted and non-overlapping. Binary search.
+	// Level 1+: files are sorted and non-overlapping, use binary search
 	for level := 1; level < NumLevels; level++ {
 		files := v.Files[level]
 		if len(files) == 0 {
 			continue
 		}
 
-		// Find the first file that has MaxKey >= key
+		// Find file with MaxKey >= target key
 		idx := sort.Search(len(files), func(i int) bool {
 			return bytes.Compare(files[i].MaxKey.UserKey(), key) >= 0
 		})
@@ -238,24 +215,20 @@ func (v *Version) Get(key []byte, opts *Options) ([]byte, error) {
 		if idx < len(files) {
 			f := files[idx]
 			if bytes.Compare(key, f.MinKey.UserKey()) >= 0 {
-				val, err := v.getFromFile(f, key, opts)
-				if err != nil {
+				if val, err := v.getFromFile(f, key, opts); err != nil {
 					return nil, err
-				}
-				if val != nil {
+				} else if val != nil {
 					return val, nil
 				}
 			}
 		}
 	}
 
-	return nil, nil
+	return nil, nil // Key not found
 }
 
 func (v *Version) getFromFile(f *FileMetadata, key []byte, opts *Options) ([]byte, error) {
-	// Open SST file
-	// In a real system, we would have a TableCache.
-	// Here we open it every time (slow but correct for this task).
+	// Open SST file and search for key
 	filename := fmt.Sprintf("%s/%06d.sst", opts.Dir, f.FileNum)
 	file, err := opts.FileSystem.Open(filename)
 	if err != nil {
@@ -263,10 +236,8 @@ func (v *Version) getFromFile(f *FileMetadata, key []byte, opts *Options) ([]byt
 	}
 	defer file.Close()
 
-	// Configure dsst options
+	// TODO: Copy encryption key and other options from opts to sstOpts
 	sstOpts := dsst.DefaultOptions()
-	// TODO: Copy relevant options from opts to sstOpts (e.g. encryption key)
-
 	reader, err := dsst.NewReader(file, sstOpts)
 	if err != nil {
 		return nil, err
@@ -275,19 +246,19 @@ func (v *Version) getFromFile(f *FileMetadata, key []byte, opts *Options) ([]byt
 	iter := reader.NewIterator()
 	defer iter.Close()
 
+	// Seek to key and check if found
 	iter.Seek(key)
 	if iter.Valid() && bytes.Equal(iter.Key(), key) {
-		// Found it.
-		// Check value type.
 		if ValueType(iter.Kind()) == TypeDeletion {
-			return nil, nil // Deleted
+			return nil, nil // Key was deleted
 		}
-		// We need to return a copy because iterator buffer might be reused/closed.
+
+		// Return copy of value (iterator buffer may be reused)
 		val := iter.Value()
 		ret := make([]byte, len(val))
 		copy(ret, val)
 		return ret, nil
 	}
 
-	return nil, nil
+	return nil, nil // Key not found in this file
 }

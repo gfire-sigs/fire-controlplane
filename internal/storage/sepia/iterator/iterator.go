@@ -42,22 +42,20 @@ func newMergeIteratorInternal(iters []Iterator) Iterator {
 	return &MergeIterator{iters: iters}
 }
 
-// MergeIterator merges multiple iterators into a single, sorted iterator.
+// MergeIterator merges multiple sorted iterators into a single sorted iterator.
+// Handles duplicate keys by returning only the newest non-deleted value.
 type MergeIterator struct {
-	iters   []Iterator
-	current Iterator
-	// The key that the iterator is currently positioned at.
-	// Used to ensure that Next() advances to a key strictly greater than the current key.
-	// This is important for merge iterators to avoid returning duplicate keys
-	// when multiple underlying iterators have the same key.
-	currentKey []byte
+	iters      []Iterator
+	current    Iterator
+	currentKey []byte // Current key to avoid duplicates
 }
 
 func (mi *MergeIterator) First() {
+	// Position all iterators at beginning and find first valid entry
 	for _, iter := range mi.iters {
 		iter.First()
 	}
-	mi.findNextValid() // Renamed from findSmallest
+	mi.findNextValid()
 }
 
 func (mi *MergeIterator) Valid() bool {
@@ -69,16 +67,14 @@ func (mi *MergeIterator) Next() {
 		return
 	}
 
-	// Advance all iterators that are currently at mi.currentKey.
-	// This ensures that we don't get stuck on the same key if multiple iterators
-	// have it, and that we correctly move to the next unique key.
+	// Advance all iterators at current key to avoid duplicates
 	for _, iter := range mi.iters {
 		if iter.Valid() && bytes.Equal(iter.Key(), mi.currentKey) {
 			iter.Next()
 		}
 	}
 
-	mi.findNextValid() // Renamed from findSmallest
+	mi.findNextValid()
 }
 
 func (mi *MergeIterator) Key() []byte {
@@ -95,12 +91,13 @@ func (mi *MergeIterator) Value() []byte {
 	return mi.current.Value()
 }
 
-// Seek moves the iterator to the first key that is greater than or equal to the given key.
+// Seek positions the iterator at the first key >= target.
 func (mi *MergeIterator) Seek(key []byte) {
+	// Seek all iterators to target position
 	for _, iter := range mi.iters {
 		iter.Seek(key)
 	}
-	mi.findNextValid() // Renamed from findSmallest
+	mi.findNextValid()
 }
 
 func (mi *MergeIterator) Close() {
@@ -109,7 +106,7 @@ func (mi *MergeIterator) Close() {
 	}
 }
 
-// findNextValid finds the next valid (non-tombstone) key-value pair.
+// findNextValid finds the next non-deleted entry across all iterators.
 func (mi *MergeIterator) findNextValid() {
 	mi.current = nil
 	mi.currentKey = nil
@@ -118,7 +115,7 @@ func (mi *MergeIterator) findNextValid() {
 		var smallestKey []byte
 		var candidateIterators []Iterator
 
-		// Find the smallest key among all valid iterators
+		// Find smallest key among all valid iterators
 		for _, iter := range mi.iters {
 			if !iter.Valid() {
 				continue
@@ -132,31 +129,28 @@ func (mi *MergeIterator) findNextValid() {
 		}
 
 		if smallestKey == nil {
-			// No more valid entries
-			return
+			return // No more entries
 		}
 
-		// Now, from the candidate iterators (all having smallestKey),
-		// find the one that is NOT a tombstone, prioritizing newer iterators.
+		// Find first non-deleted entry among candidates
 		var bestIterator Iterator
 		for _, iter := range candidateIterators {
-			if iter.Value() != nil { // Found a non-tombstone
+			if iter.Value() != nil { // Non-tombstone found
 				bestIterator = iter
-				break // Found the newest non-tombstone, so we can stop
+				break
 			}
 		}
 
 		if bestIterator != nil {
-			// Found a valid (non-tombstone) entry for smallestKey
+			// Valid entry found
 			mi.current = bestIterator
 			mi.currentKey = smallestKey
 			return
-		} else {
-			// All iterators for smallestKey are tombstones.
-			// Advance all of them and try again.
-			for _, iter := range candidateIterators {
-				iter.Next()
-			}
+		}
+
+		// All candidates are tombstones - advance and retry
+		for _, iter := range candidateIterators {
+			iter.Next()
 		}
 	}
 }
