@@ -3,7 +3,6 @@
 package mskip
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -244,15 +243,8 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 
 	// Update next pointers at each level
 	for i := int32(0); i < level; i++ {
-		node.nexts[i] = g.getNode(log[i]).nexts[i] // Set new node's next pointer
-
-		prevNode := g.getNode(log[i])
-		prevNode.nexts[i] = marena.Offset(newNodeSize) // Update previous node's next pointer
-
-		// Debug: print address and value
-		addr := &prevNode.nexts[i]
-		fmt.Printf("mskip: insertNext level %d: prev %d nexts[%d] addr %p set to %d. Readback: %d\n",
-			i, log[i], i, addr, marena.Offset(newNodeSize), prevNode.nexts[i])
+		node.nexts[i] = g.getNode(log[i]).nexts[i]
+		g.getNode(log[i]).nexts[i] = marena.Offset(newNodeSize)
 	}
 
 	return marena.Offset(newNodeSize)
@@ -264,19 +256,10 @@ func (g *SkipList) insertNext(log *[MSKIP_MAX_LEVEL]uint32, key []byte, value []
 func (g *SkipList) Insert(key []byte, value []byte) bool {
 	var log [MSKIP_MAX_LEVEL]uint32
 	g.seeklt(key, &log)
-
-	head := g.getNode(g.head)
-	fmt.Printf("mskip: Insert before insertNext: head at %d keyPtr %d\n", g.head, marena.Offset(head.keyPtr))
-
 	res := g.insertNext(&log, key, value)
-
-	fmt.Printf("mskip: Insert after insertNext: head at %d keyPtr %d\n", g.head, marena.Offset(head.keyPtr))
-
 	if res == marena.ARENA_INVALID_ADDRESS {
-		fmt.Println("mskip: Insert failed (alloc)")
 		return false
 	}
-	fmt.Printf("mskip: Inserted key %s at %d\n", key, res)
 	return true
 }
 
@@ -313,9 +296,7 @@ func (g *SkipList) Iterator() *SkipListIterator {
 // if the skiplist is not empty.
 func (g *SkipListIterator) First() {
 	g.current = g.skl.head
-	fmt.Printf("mskip: First starting at head %d\n", g.current)
 	g.Next()
-	fmt.Printf("mskip: First ended at %d (valid=%v)\n", g.current, g.Valid())
 }
 
 // SeekLT (Seek Less Than) positions the iterator at the largest key strictly less than
@@ -330,25 +311,17 @@ func (g *SkipListIterator) SeekLT(key []byte) {
 // will be positioned at that exact key. If no such key exists, the iterator
 // becomes invalid.
 func (g *SkipListIterator) SeekLE(key []byte) {
-	fmt.Printf("mskip: SeekLE called for key %s\n", key)
 	var log [MSKIP_MAX_LEVEL]uint32
-	// Find the node whose key is strictly less than 'key'.
-	// This will be the node *before* the one we are looking for, or the head.
 	prevNodePtr := g.skl.seeklt(key, &log)
-	fmt.Printf("mskip: SeekLE prevNodePtr %d\n", prevNodePtr)
 
-	// If prevNodePtr is the head, it means all keys in the skiplist are >= 'key'.
-	// In this case, we need to check if the first element is equal to 'key'.
 	if prevNodePtr == g.skl.head {
 		firstNodePtr := g.skl.getNode(g.skl.head).nexts[0]
-		fmt.Printf("mskip: SeekLE firstNodePtr %d\n", firstNodePtr)
 		if firstNodePtr != marena.ARENA_INVALID_ADDRESS {
 			cmp := g.skl.compare(key, g.skl.arena.View(g.skl.getNode(firstNodePtr).keyPtr))
-			fmt.Printf("mskip: SeekLE compare result %d\n", cmp)
 			if cmp == 0 {
 				g.current = firstNodePtr
 			} else {
-				g.current = marena.ARENA_INVALID_ADDRESS // No key <= 'key' found
+				g.current = marena.ARENA_INVALID_ADDRESS
 			}
 		} else {
 			g.current = marena.ARENA_INVALID_ADDRESS
@@ -356,17 +329,11 @@ func (g *SkipListIterator) SeekLE(key []byte) {
 		return
 	}
 
-	// If prevNodePtr is not the head, it means we found a node whose key is < 'key'.
-	// Now, check the node *after* prevNodePtr. This might be the 'key' itself.
-	g.current = prevNodePtr // Start by pointing to the node found by seeklt
-
-	// Check if the next node is equal to 'key'.
+	g.current = prevNodePtr
 	nextNodePtr := g.skl.getNode(g.current).nexts[0]
 	if nextNodePtr != marena.ARENA_INVALID_ADDRESS && g.skl.compare(key, g.skl.arena.View(g.skl.getNode(nextNodePtr).keyPtr)) == 0 {
-		g.current = nextNodePtr // Move to the exact match
+		g.current = nextNodePtr
 	}
-	// If nextNodePtr is not an exact match, g.current remains prevNodePtr, which is the largest key <= 'key'.
-	// This is the correct behavior for SeekLE.
 }
 
 // Valid returns true if the iterator is positioned at a valid node in the skiplist.
@@ -381,12 +348,8 @@ func (g *SkipListIterator) Next() {
 	if !g.Valid() {
 		return
 	}
-
 	node := g.skl.getNode(g.current)
-	addr := &node.nexts[0]
-	val := node.nexts[0]
-	g.current = val
-	fmt.Printf("mskip: Next at %d reading nexts[0] from %p: %d\n", marena.Offset(node.keyPtr), addr, val)
+	g.current = node.nexts[0]
 }
 
 // Prev moves the iterator to the previous key in the skiplist.
@@ -432,14 +395,10 @@ func (g *SkipListIterator) Value() []byte {
 
 // Seek moves the iterator to the first key that is greater than or equal to the given key.
 func (g *SkipListIterator) Seek(key []byte) {
-	fmt.Printf("mskip: Seek called for key %s\n", key)
 	g.SeekLE(key)
-	fmt.Printf("mskip: Seek after SeekLE valid=%v current=%d\n", g.Valid(), g.current)
 	if !g.Valid() {
-		fmt.Println("mskip: Seek calling First")
 		g.First()
 	} else if g.skl.compare(g.Key(), key) < 0 {
-		fmt.Println("mskip: Seek calling Next")
 		g.Next()
 	}
 }
