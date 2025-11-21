@@ -382,19 +382,11 @@ func (g *SkipListIterator) Next() {
 		return
 	}
 
-	// Advance until a non-tombstone entry is found or end of list is reached.
-	for {
-		node := g.skl.getNode(g.current)
-		addr := &node.nexts[0]
-		val := node.nexts[0]
-		g.current = val
-		fmt.Printf("mskip: Next at %d reading nexts[0] from %p: %d\n", marena.Offset(node.keyPtr), addr, val) // keyPtr might be invalid for head
-		// Actually head keyPtr is invalid.
-		// fmt.Printf("mskip: Next moved to %d\n", g.current)
-		if !g.Valid() || g.Value() != nil {
-			break // Found a valid entry or reached end of list
-		}
-	}
+	node := g.skl.getNode(g.current)
+	addr := &node.nexts[0]
+	val := node.nexts[0]
+	g.current = val
+	fmt.Printf("mskip: Next at %d reading nexts[0] from %p: %d\n", marena.Offset(node.keyPtr), addr, val)
 }
 
 // Prev moves the iterator to the previous key in the skiplist.

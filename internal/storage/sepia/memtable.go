@@ -3,7 +3,6 @@ package sepia
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"sync/atomic"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/marena"
@@ -41,28 +40,30 @@ func (m *MemTable) Add(seq uint64, t ValueType, key, value []byte) error {
 // Get looks up a key in the memtable.
 func (m *MemTable) Get(key []byte) (value []byte, err error) {
 	// We want the latest version of the key.
-	// Our comparator sorts UserKey asc, SeqNum desc.
-	// So "key + MaxSeq" is the first entry for "key".
-	lookupKey := NewInternalKey(key, ^uint64(0)>>8, TypeValue) // Max seq
-
+	// Our comparator sorts UserKey asc, then SeqNum desc.
+	// So for a given UserKey, the FIRST entry has the highest (latest) SeqNum.
+	//
+	// Strategy: Iterate from the beginning until we find a matching UserKey.
+	// Since keys are sorted by UserKey first, once we find a match, it will be the latest version.
 	iter := m.skiplist.Iterator()
 	defer iter.Close()
 
-	iter.Seek(lookupKey)
-	if iter.Valid() {
-		// Check if user key matches
+	iter.First()
+	for iter.Valid() {
 		internalKey := InternalKey(iter.Key())
-		fmt.Printf("Get(%s): Found key %s seq %d type %d trailer=%x\n", key, internalKey.UserKey(), internalKey.SeqNum(), internalKey.Type(), internalKey.Trailer())
-		if bytes.Equal(internalKey.UserKey(), key) {
+		cmp := bytes.Compare(internalKey.UserKey(), key)
+		if cmp == 0 {
 			// Found it. Check type.
 			if internalKey.Type() == TypeValue {
 				return iter.Value(), nil
 			}
 			// Deleted
-			return nil, nil // or ErrNotFound
+			return nil, nil
+		} else if cmp > 0 {
+			// We've passed the key, it doesn't exist
+			break
 		}
-	} else {
-		fmt.Printf("Get(%s): Seek found nothing\n", key)
+		iter.Next()
 	}
 	return nil, nil // Not found
 }
