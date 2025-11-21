@@ -373,3 +373,18 @@ func (w *Writer) Close() error {
 	w.closed = true
 	return w.file.Close()
 }
+
+// MinKey returns the minimum key written to the SST.
+func (w *Writer) MinKey() []byte {
+	return w.minKey
+}
+
+// MaxKey returns the maximum key written to the SST.
+func (w *Writer) MaxKey() []byte {
+	return w.maxKey
+}
+
+// Size returns the current size of the SST file.
+func (w *Writer) Size() uint64 {
+	return uint64(w.offset)
+}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/marena"
@@ -16,7 +15,6 @@ type MemTable struct {
 	skiplist *mskip.SkipList
 	arena    *marena.Arena
 	ref      int32
-	mu       sync.Mutex
 }
 
 // NewMemTable creates a new MemTable.
@@ -50,27 +48,11 @@ func (m *MemTable) Get(key []byte) (value []byte, err error) {
 	iter := m.skiplist.Iterator()
 	defer iter.Close()
 
-	// Seek to the first entry >= lookupKey.
-	// Since our comparator is (UserKey asc, SeqNum desc),
-	// key+MaxSeq is "smaller" than key+MinSeq?
-	// Wait.
-	// UserKey: "a" < "b".
-	// SeqNum: 100 > 50.
-	// InternalKeyComparator:
-	// Compare("a", "b") -> -1.
-	// Compare("a"+100, "a"+50):
-	//   UserKey equal.
-	//   Trailer(100) > Trailer(50).
-	//   Returns -1 (descending).
-	// So "a"+100 < "a"+50.
-	// So "a"+MaxSeq is the SMALLEST key for "a".
-	// So Seek("a"+MaxSeq) should land on "a"+MaxSeq (or the first entry for "a").
-
 	iter.Seek(lookupKey)
 	if iter.Valid() {
 		// Check if user key matches
 		internalKey := InternalKey(iter.Key())
-		fmt.Printf("Get(%s): Found key %s seq %d type %d\n", key, internalKey.UserKey(), internalKey.SeqNum(), internalKey.Type())
+		fmt.Printf("Get(%s): Found key %s seq %d type %d trailer=%x\n", key, internalKey.UserKey(), internalKey.SeqNum(), internalKey.Type(), internalKey.Trailer())
 		if bytes.Equal(internalKey.UserKey(), key) {
 			// Found it. Check type.
 			if internalKey.Type() == TypeValue {

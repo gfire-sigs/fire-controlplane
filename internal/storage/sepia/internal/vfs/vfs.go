@@ -25,4 +25,5 @@ type FileSystem interface {
 	Rename(oldpath, newpath string) error
 	Stat(name string) (os.FileInfo, error)
 	MkdirAll(path string, perm os.FileMode) error
+	List(dir string) ([]string, error)
 }

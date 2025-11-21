@@ -39,3 +39,15 @@ func (fs *DirFileSystem) Rename(oldpath, newpath string) error {
 func (fs *DirFileSystem) Stat(name string) (os.FileInfo, error) {
 	return os.Stat(name)
 }
+
+func (fs *DirFileSystem) List(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names, nil
+}

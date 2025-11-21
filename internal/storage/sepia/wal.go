@@ -11,7 +11,8 @@ import (
 // LogWriter writes records to a WAL file.
 // Format: Checksum (4) + Length (2) + Type (1) + Data.
 // Type: 1 = Full, 2 = First, 3 = Middle, 4 = Last.
-// For simplicity, we'll just use Full records for now (no fragmentation).
+// Type: 1 = Full, 2 = First, 3 = Middle, 4 = Last.
+// We use Full records for now.
 type LogWriter struct {
 	file vfs.File
 }

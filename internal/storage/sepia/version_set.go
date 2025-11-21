@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 
+	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/dsst"
 	"pkg.gfire.dev/controlplane/internal/storage/sepia/internal/vfs"
 )
 
@@ -202,4 +203,93 @@ func (vs *VersionSet) PickCompaction() (int, []*FileMetadata) {
 	}
 
 	return -1, nil
+}
+
+// Get looks up a key in the version.
+func (v *Version) Get(key []byte, opts *Options) ([]byte, error) {
+	// 1. Level 0: files may overlap, so we must check all of them from newest to oldest.
+	// In our list, they are appended, so newest is at the end?
+	// VersionSet.LogAndApply appends new files. So yes, later indices are newer.
+	// We should iterate backwards.
+	for i := len(v.Files[0]) - 1; i >= 0; i-- {
+		f := v.Files[0][i]
+		// Check key range
+		if bytes.Compare(key, f.MinKey.UserKey()) >= 0 && bytes.Compare(key, f.MaxKey.UserKey()) <= 0 {
+			val, err := v.getFromFile(f, key, opts)
+			if err != nil {
+				return nil, err
+			}
+			if val != nil {
+				return val, nil
+			}
+		}
+	}
+
+	// 2. Level > 0: files are sorted and non-overlapping. Binary search.
+	for level := 1; level < NumLevels; level++ {
+		files := v.Files[level]
+		if len(files) == 0 {
+			continue
+		}
+
+		// Find the first file that has MaxKey >= key
+		idx := sort.Search(len(files), func(i int) bool {
+			return bytes.Compare(files[i].MaxKey.UserKey(), key) >= 0
+		})
+
+		if idx < len(files) {
+			f := files[idx]
+			if bytes.Compare(key, f.MinKey.UserKey()) >= 0 {
+				val, err := v.getFromFile(f, key, opts)
+				if err != nil {
+					return nil, err
+				}
+				if val != nil {
+					return val, nil
+				}
+			}
+		}
+	}
+
+	return nil, nil
+}
+
+func (v *Version) getFromFile(f *FileMetadata, key []byte, opts *Options) ([]byte, error) {
+	// Open SST file
+	// In a real system, we would have a TableCache.
+	// Here we open it every time (slow but correct for this task).
+	filename := fmt.Sprintf("%s/%06d.sst", opts.Dir, f.FileNum)
+	file, err := opts.FileSystem.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// Configure dsst options
+	sstOpts := dsst.DefaultOptions()
+	// TODO: Copy relevant options from opts to sstOpts (e.g. encryption key)
+
+	reader, err := dsst.NewReader(file, sstOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	iter := reader.NewIterator()
+	defer iter.Close()
+
+	iter.Seek(key)
+	if iter.Valid() && bytes.Equal(iter.Key(), key) {
+		// Found it.
+		// Check value type.
+		if ValueType(iter.Kind()) == TypeDeletion {
+			return nil, nil // Deleted
+		}
+		// We need to return a copy because iterator buffer might be reused/closed.
+		val := iter.Value()
+		ret := make([]byte, len(val))
+		copy(ret, val)
+		return ret, nil
+	}
+
+	return nil, nil
 }
