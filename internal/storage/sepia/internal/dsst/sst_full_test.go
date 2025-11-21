@@ -1,6 +1,7 @@
 package dsst
 
 import (
+	"encoding/binary"
 	"io"
 	"testing"
 
@@ -232,4 +233,139 @@ func TestBloomFilter(t *testing.T) {
 	}
 	// "missing" might be false positive, but usually not with 10 bits
 	// We can't assert false strictly, but we can check it runs.
+}
+
+func TestMVCCAndCompaction(t *testing.T) {
+	fs := vfs.NewMemFileSystem()
+	f, err := fs.Create("mvcc.sst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultOptions()
+	w, err := NewWriter(f, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Helper to encode Key + Inverted TS
+	// This ensures that for the same key, higher TS comes first.
+	encodeKey := func(key string, ts uint64) []byte {
+		k := []byte(key)
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], ^ts) // Invert bits to reverse order
+		return append(k, buf[:]...)
+	}
+
+	// Write Data
+	// key1: TS=30 (Put), TS=20 (Put), TS=10 (Put)
+	// key2: TS=15 (Put) -> Old, but it's the LATEST version for key2. Should be kept!
+	// key1: TS=35 (Delete) -> This should come first!
+	// Correct Order:
+	// key1 @ 35 (Del)
+	// key1 @ 30 (Put)
+	// key1 @ 20 (Put)
+	// key1 @ 10 (Put)
+	// key2 @ 15 (Put)
+
+	w.AddDeleted(encodeKey("key1", 35))
+	w.Add(encodeKey("key1", 30), []byte("v30"))
+	w.Add(encodeKey("key1", 20), []byte("v20"))
+	w.Add(encodeKey("key1", 10), []byte("v10"))
+	w.Add(encodeKey("key2", 15), []byte("v15"))
+	w.Close()
+
+	// Compaction Simulation
+	// Filter:
+	// 1. Always keep the LATEST version of a key (even if old).
+	// 2. For older versions, drop if TS < 25.
+
+	f, _ = fs.Open("mvcc.sst")
+	r, err := NewReader(f, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := r.NewIterator()
+
+	outF, _ := fs.Create("compacted.sst")
+	outW, _ := NewWriter(outF, opts)
+
+	var lastUserKey string
+	var isFirstVersion bool
+
+	for it.First(); it.Valid(); it.Next() {
+		key := it.Key()
+		// Decode TS
+		if len(key) < 8 {
+			continue
+		}
+		userKey := string(key[:len(key)-8])
+		ts := ^binary.BigEndian.Uint64(key[len(key)-8:])
+
+		// Stateful Logic
+		if userKey != lastUserKey {
+			// New key found! This must be the latest version (due to sort order).
+			lastUserKey = userKey
+			isFirstVersion = true
+		} else {
+			isFirstVersion = false
+		}
+
+		// Filter Logic
+		shouldKeep := false
+		if isFirstVersion {
+			shouldKeep = true // Rule 1: Always keep latest
+		} else if ts >= 25 {
+			shouldKeep = true // Rule 2: Keep if not too old
+		}
+
+		if !shouldKeep {
+			continue
+		}
+
+		// Write to new file
+		if it.Kind() == 1 { // Delete
+			outW.AddDeleted(key)
+		} else {
+			outW.Add(key, it.Value())
+		}
+	}
+	outW.Close()
+
+	// Verify Compacted File
+	outF, _ = fs.Open("compacted.sst")
+	outR, _ := NewReader(outF, opts)
+	outIt := outR.NewIterator()
+
+	// Expected:
+	// key1 @ 35 (Del) -> Kept (Latest)
+	// key1 @ 30 (Put) -> Kept (TS >= 25)
+	// key1 @ 20 (Put) -> Dropped (Not Latest AND TS < 25)
+	// key1 @ 10 (Put) -> Dropped (Not Latest AND TS < 25)
+	// key2 @ 15 (Put) -> Kept (Latest, even though TS < 25)
+
+	expectedCount := 3
+	count := 0
+	for outIt.First(); outIt.Valid(); outIt.Next() {
+		key := outIt.Key()
+		userKey := string(key[:len(key)-8])
+		ts := ^binary.BigEndian.Uint64(key[len(key)-8:])
+
+		t.Logf("Kept: %s @ %d", userKey, ts)
+
+		if userKey == "key1" {
+			if ts == 20 || ts == 10 {
+				t.Errorf("Should have dropped key1 @ %d", ts)
+			}
+		}
+		if userKey == "key2" {
+			if ts != 15 {
+				t.Errorf("Unexpected key2 version: %d", ts)
+			}
+		}
+		count++
+	}
+
+	if count != expectedCount {
+		t.Errorf("Expected %d keys, got %d", expectedCount, count)
+	}
 }
